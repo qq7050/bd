@@ -1,7 +1,8 @@
 name: Build BaiduSpeedBoost dylib
 
-# 上传本工程到 GitHub 仓库后，此工作流在云端 macOS 上编译，无需你有 Mac。
-# 触发方式：push 代码，或在 Actions 页面手动点 "Run workflow"。
+# 云端 macOS 编译，无需本地 Mac。上传工程后自动触发，也可在 Actions 页手动 Run。
+# 不使用第三方 theos-action（其相对路径 THEOS 在下载 SDK 时有 mv 路径 bug），
+# 改为全绝对路径手动搭建，稳定可复现。
 
 on:
   workflow_dispatch:
@@ -15,31 +16,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Theos
-        uses: Randomblock1/theos-action@v1
-        with:
-          theos-dir: theos
-          # 用带 rootless 补丁的 SDK 源，确保支持 iOS 15+
-          theos-sdks: https://github.com/theos/sdks
-
-      - name: Build tweaks
+      - name: Install build tools
         run: |
+          brew install ldid make wget
+
+      - name: Setup Theos (absolute paths)
+        run: |
+          set -e
           export THEOS="$GITHUB_WORKSPACE/theos"
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          cd "$THEOS/sdks"
+          wget --no-verbose https://github.com/theos/sdks/archive/refs/heads/master.tar.gz -O master.tar.gz
+          TMP=$(mktemp -d)
+          tar -xzf master.tar.gz -C "$TMP"
+          mv "$TMP"/*-master/*.sdk "$THEOS/sdks/"
+          rm -rf master.tar.gz "$TMP"
+          echo "SDKs installed:" && ls "$THEOS/sdks"
+
+      - name: Build (rootful + rootless)
+        run: |
+          set -e
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
           echo "THEOS=$THEOS"
-          # 普通(rootful)版本
           make clean
           make package FINALPACKAGE=1
-          # TrollStore/TrollFools 用 rootless 版本（巨魔环境必须用这个）
           make clean
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-          echo "=== 产物 ==="
-          find . -name "*.dylib" -o -name "*.deb" | sort
+          echo "=== products ==="
+          find "$GITHUB_WORKSPACE" \( -name "*.dylib" -o -name "*.deb" \) -not -path "*/theos/*" | sort
 
       - name: Upload dylib + deb
         uses: actions/upload-artifact@v4
         with:
           name: BaiduSpeedBoost-build
-          # .theos/obj 是编译出的裸 dylib；packages 是 deb 包
           path: |
             .theos/obj/*.dylib
             packages/*.deb
