@@ -1,169 +1,153 @@
 //
-//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强（All-in-One v4）
+//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v5 诊断版)
 //
-//  功能:
-//    1) SVIP 标志 + 完整去广告（一比一还原原 baidudisk.dylib）
-//    2) 抓真实下载直链(dlink)到 App 沙盒 Documents，供多线程下载器使用
-//
-//  v4 变更: 系统层 NSURLSession/NSURLConnection hook 抓不到（13.35.5 走自研网络库）。
-//           改为直接 hook 百度自己的下载类:
-//             BDPMDownloadOperation.setDlinkUrl:   / startDownTaskUrl:
-//             BDPMFileDownloadModel.setDlink:
-//             BDPBridgeAlbumFileDlinkItem.setDlink:
-//             DownOperation.downWithServerFullPath:localFullPath:downsize:
-//           无论底层网络怎么封装，直链必定流经这些入口。
-//           另写 bnt_hooks.txt 记录哪个 hook 命中，便于诊断。
-//
-//  写文件位置: App 沙盒 Documents (NSSearchPathForDirectoriesInDomains)
+//  v4 问题: %ctor 能写 bnt_loaded.txt, 但所有 %hook 零命中(连 SVIP 去广告都失效)。
+//  v5 方案: 不用 Theos %hook, 改在 %ctor 里用 MSHookMessageEx 运行时动态 hook,
+//           并把「类是否存在 / 方法是否存在 / hook 是否安装 / 方法是否被调用」
+//           全部写进 bnt_debug.txt, 一次测试定位根因。
 //
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#import <substrate.h>
 
+/* ---------- 文件工具 ---------- */
 static NSString *BNDocs(void) {
     NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     return (p.count ? p[0] : @"/var/mobile/Documents");
 }
-static NSString *BNLinksFile(void)   { return [BNDocs() stringByAppendingPathComponent:@"baidu_links.txt"]; }
-static NSString *BNDetailFile(void)  { return [BNDocs() stringByAppendingPathComponent:@"baidu_dlinks.txt"]; }
-static NSString *BNMarkerFile(void)  { return [BNDocs() stringByAppendingPathComponent:@"bnt_loaded.txt"]; }
-static NSString *BNHookFile(void)    { return [BNDocs() stringByAppendingPathComponent:@"bnt_hooks.txt"]; }
-
-static BOOL BNIsDownloadURL(NSURL *u) {
-    if (!u) return NO;
-    NSString *s = [[u absoluteString] lowercaseString];
-    if ([s containsString:@"d.pcs.baidu.com"] ||
-        [s containsString:@"d-drive.pcs.baidu.com"] ||
-        [s containsString:@"issuecdn.baidupcs.com"] ||
-        [s containsString:@"sdata.baidupcs.com"] ||
-        [s containsString:@"netdisk-wps.baidupcs.com"] ||
-        [s containsString:@"cdndoc.pcs.baidu.com"] ||
-        [s containsString:@"/rest/2.0/pcs/file"] ||
-        [s containsString:@"method=download"]) return YES;
-    return NO;
-}
-
-static void BNAppendText(NSString *path, NSString *line) {
+static NSString *BNPath(NSString *n) { return [BNDocs() stringByAppendingPathComponent:n]; }
+static void BNAppend(NSString *file, NSString *line) {
+    NSString *path = BNPath(file);
     NSString *old = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     if (!old) old = @"";
     if ([old rangeOfString:line].location != NSNotFound) return;
     NSString *ns = old.length ? [old stringByAppendingFormat:@"\n%@", line] : line;
     [ns writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
-
-// 记录 hook 命中（诊断：确认类级 hook 是否真的触发）
-static void BNMarkHook(NSString *tag) {
-    BNAppendText(BNHookFile(), [NSString stringWithFormat:@"HIT %@", tag]);
-}
-
-// 通用：把一个可能是 URL 的对象写文件（NSString / NSURL 都支持）
-static void BNRecordURL(id obj, NSString *tag) {
-    BNMarkHook(tag);
+static void BNDebug(NSString *s) { BNAppend(@"bnt_debug.txt", s); }
+static void BNHit(NSString *tag) { BNAppend(@"bnt_hooks.txt", [NSString stringWithFormat:@"HIT %@", tag]); }
+static void BNUrl(id obj, NSString *tag) {
     NSString *s = nil;
     if ([obj isKindOfClass:[NSString class]]) s = (NSString *)obj;
     else if ([obj isKindOfClass:[NSURL class]]) s = [(NSURL *)obj absoluteString];
+    else if (obj) s = [obj description];
     if (!s.length) return;
-    if ([s hasPrefix:@"http://"] || [s hasPrefix:@"https://"]) {
-        BNAppendText(BNLinksFile(), s);
-        BNAppendText(BNDetailFile(), [NSString stringWithFormat:@"%@\t[%@]", s, tag]);
-    } else {
-        // 非完整 URL（如 serverFullPath）也记录，便于诊断
-        BNAppendText(BNDetailFile(), [NSString stringWithFormat:@"RAW(%@): %@", tag, s]);
-    }
+    BNAppend(@"baidu_links.txt", s);
+    BNAppend(@"baidu_dlinks.txt", [NSString stringWithFormat:@"%@\t[%@]", s, tag]);
 }
 
-static void BNHandleRequest(NSURLRequest *req) {
-    if (!BNIsDownloadURL(req.URL)) return;
-    NSString *url = req.URL.absoluteString;
-    if (!url.length) return;
-    BNAppendText(BNLinksFile(), url);
-    NSMutableString *detail = [NSMutableString stringWithString:url];
-    NSDictionary *h = req.allHTTPHeaderFields;
-    for (NSString *k in h) [detail appendFormat:@"\t%@: %@", k, h[k]];
-    BNAppendText(BNDetailFile(), detail);
+/* ---------- 原函数指针 ---------- */
+static void (*o_down)(id, SEL, id, id, long long) = NULL;
+static void (*o_start)(id, SEL) = NULL;
+static void (*o_startTask)(id, SEL) = NULL;
+static void (*o_dlPCS)(id, SEL) = NULL;
+static void (*o_startNormal)(id, SEL) = NULL;
+static id  (*o_limit)(id, SEL) = NULL;
+static id  (*o_token)(id, SEL) = NULL;
+static void (*o_setDlink)(id, SEL, id) = NULL;
+static void (*o_setDlinkUrl)(id, SEL, id) = NULL;
+static BOOL (*o_isSVIP)(id, SEL) = NULL;
+static void (*o_setAdModel)(id, SEL, id) = NULL;
+
+/* ---------- Hook 实现 ---------- */
+static void h_down(id self, SEL _cmd, id p, id l, long long sz) {
+    BNHit(@"DownOperation.downWithServerFullPath");
+    if (p) BNUrl(p, @"downWithServerFullPath");
+    if (o_down) o_down(self, _cmd, p, l, sz);
+}
+static void h_start(id self, SEL _cmd) {
+    BNHit(@"DownOperation.start");
+    if (o_start) o_start(self, _cmd);
+}
+static void h_startTask(id self, SEL _cmd) {
+    BNHit(@"DownOperation.startDownloadTask");
+    if (o_startTask) o_startTask(self, _cmd);
+}
+static void h_dlPCS(id self, SEL _cmd) {
+    BNHit(@"DownOperation.downloadFromPCS");
+    if (o_dlPCS) o_dlPCS(self, _cmd);
+}
+static void h_startNormal(id self, SEL _cmd) {
+    BNHit(@"DownOperation.startNormalDownload");
+    if (o_startNormal) o_startNormal(self, _cmd);
+}
+static id h_limit(id self, SEL _cmd) {
+    BNHit(@"DownOperation.calucateDownloadSpeedLimit");
+    id r = o_limit ? o_limit(self, _cmd) : nil;
+    BNDebug([NSString stringWithFormat:@"speedLimit=%@", r]);
+    return r;
+}
+static id h_token(id self, SEL _cmd) {
+    BNHit(@"DownOperation.speedUpToken");
+    id r = o_token ? o_token(self, _cmd) : nil;
+    BNDebug([NSString stringWithFormat:@"speedUpToken=%@", r]);
+    return r;
+}
+static void h_setDlink(id self, SEL _cmd, id u) {
+    BNHit(@"setDlink");
+    if (u) BNUrl(u, @"setDlink");
+    if (o_setDlink) o_setDlink(self, _cmd, u);
+}
+static void h_setDlinkUrl(id self, SEL _cmd, id u) {
+    BNHit(@"setDlinkUrl");
+    if (u) BNUrl(u, @"setDlinkUrl");
+    if (o_setDlinkUrl) o_setDlinkUrl(self, _cmd, u);
+}
+static BOOL h_isSVIP(id self, SEL _cmd) {
+    BNHit(@"BDPanAccountInfo.isSVIP");
+    return YES;
+}
+static void h_setAdModel(id self, SEL _cmd, id a) {
+    BNHit(@"BDPanActivityFloatWidget.setAdModel");
+    if (o_setAdModel) o_setAdModel(self, _cmd, nil);
 }
 
-#pragma mark - 1. SVIP + 完整去广告（一比一还原原 dylib）
-
-%hook BDPanAccountInfo
-- (BOOL)isSVIP { return YES; }
-- (BOOL)isVipCanShowAdvertise { return NO; }
-- (BOOL)hasPurchasedAdFree { return YES; }
-- (NSInteger)vipLevel { return 10; }
-%end
-
-%hook BDPanActivityFloatWidget
-- (void)setAdModel:(id)a { %orig(nil); }
-%end
-
-%hook BDPanHridWebViewController
-- (void)setSplashWindow:(id)a { %orig(nil); }
-%end
-
-%hook BDPanPersonHeaderView
-- (void)setTabBadgeNumber:(id)a maxNumber:(id)b atIndex:(NSInteger)i { %orig(nil, nil, i); }
-%end
-
-%hook BDPanPersonalWalletSection
-- (void)setTabBadgeNumber:(id)a maxNumber:(id)b atIndex:(NSInteger)i { %orig(nil, nil, i); }
-%end
-
-%hook BDNCAdvertiseDataManage
-- (void)setupViews { %orig; }
-%end
-
-#pragma mark - 2a. 系统网络层（兜底，v3 保留）
-
-%hook NSURLSession
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r { BNHandleRequest(r); return %orig; }
-- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)r { BNHandleRequest(r); return %orig; }
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)u {
-    if (BNIsDownloadURL(u)) BNHandleRequest([NSURLRequest requestWithURL:u]);
-    return %orig;
+/* ---------- 动态 hook 安装器 ---------- */
+static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IMP *orig) {
+    Class c = objc_getClass(clsName.UTF8String);
+    if (!c) { BNDebug([NSString stringWithFormat:@"CLASS MISSING %@.%@", clsName, selName]); return; }
+    SEL s = NSSelectorFromString(selName);
+    Method m = class_getInstanceMethod(c, s);
+    if (!m) { BNDebug([NSString stringWithFormat:@"METHOD MISSING %@.%@", clsName, selName]); return; }
+    IMP before = method_getImplementation(m);
+    MSHookMessageEx(c, s, replacement, orig);
+    IMP after = method_getImplementation(m);
+    BNDebug([NSString stringWithFormat:@"HOOK %@.%@ before=%p after=%p %@",
+             clsName, selName, before, after, (after != before ? @"OK" : @"FAILED")]);
 }
-- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)u {
-    if (BNIsDownloadURL(u)) BNHandleRequest([NSURLRequest requestWithURL:u]);
-    return %orig;
-}
-%end
-
-%hook NSURLConnection
-+ (NSURLConnection *)connectionWithRequest:(NSURLRequest *)r delegate:(id)del { BNHandleRequest(r); return %orig; }
-- (id)initWithRequest:(NSURLRequest *)r delegate:(id)del { BNHandleRequest(r); return %orig; }
-%end
-
-#pragma mark - 2b. 百度自研下载类（v4 核心：直链必经入口）
-
-%hook BDPMDownloadOperation
-// 直链 setter：服务器返回 dlink 后写入
-- (void)setDlinkUrl:(id)url { BNRecordURL(url, @"BDPMDownloadOperation.setDlinkUrl"); %orig; }
-// 下载任务启动：直接拿到要下载的 URL
-- (void)startDownTaskUrl:(id)url { BNRecordURL(url, @"BDPMDownloadOperation.startDownTaskUrl"); %orig; }
-%end
-
-%hook BDPMFileDownloadModel
-- (void)setDlink:(id)url { BNRecordURL(url, @"BDPMFileDownloadModel.setDlink"); %orig; }
-%end
-
-%hook BDPBridgeAlbumFileDlinkItem
-- (void)setDlink:(id)url { BNRecordURL(url, @"BDPBridgeAlbumFileDlinkItem.setDlink"); %orig; }
-%end
-
-%hook DownOperation
-// serverFullPath 是下载源路径，部分场景直接是完整 URL
-- (void)downWithServerFullPath:(id)path localFullPath:(id)local downsize:(long long)size {
-    BNRecordURL(path, @"DownOperation.downWithServerFullPath");
-    %orig;
-}
-%end
 
 %ctor {
-    NSString *mark = [NSString stringWithFormat:@"loaded(v4) %@\ndocs=%@\n", [NSDate date], BNDocs()];
-    [mark writeToFile:BNMarkerFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *mark = [NSString stringWithFormat:@"loaded(v5) %@\ndocs=%@\n", [NSDate date], BNDocs()];
+    [mark writeToFile:BNPath(@"bnt_loaded.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:BNLinksFile()])
-        [@"" writeToFile:BNLinksFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    if (![fm fileExistsAtPath:BNDetailFile()])
-        [@"" writeToFile:BNDetailFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    if (![fm fileExistsAtPath:BNHookFile()])
-        [@"bnt_hooks: which dlink hook fired\n" writeToFile:BNHookFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    NSLog(@"[BNDTools] v4 loaded. docs=%@", BNDocs());
+    for (NSString *f in @[@"bnt_hooks.txt", @"bnt_debug.txt", @"baidu_links.txt", @"baidu_dlinks.txt"]) {
+        if (![fm fileExistsAtPath:BNPath(f)])
+            [@"" writeToFile:BNPath(f) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    BNDebug(@"=== v5 ctor start ===");
+
+    // 诊断: 关键类是否注册
+    for (NSString *cn in @[@"BDPanAccountInfo", @"DownOperation", @"FolderDownOperation",
+                           @"ResourceDownOperation", @"BDPMDownloadOperation",
+                           @"BDPMFileDownloadModel", @"BDPBridgeAlbumFileDlinkItem",
+                           @"BDPanFileDownloadEngine"]) {
+        BNDebug([NSString stringWithFormat:@"class %@ = %@",
+                 cn, objc_getClass(cn.UTF8String) ? @"YES" : @"NO"]);
+    }
+
+    // 安装 hook
+    hookMethod(@"DownOperation", @"downWithServerFullPath:localFullPath:downsize:", (IMP)h_down,  (IMP*)&o_down);
+    hookMethod(@"DownOperation", @"start",                    (IMP)h_start,      (IMP*)&o_start);
+    hookMethod(@"DownOperation", @"startDownloadTask",        (IMP)h_startTask,  (IMP*)&o_startTask);
+    hookMethod(@"DownOperation", @"downloadFromPCS",          (IMP)h_dlPCS,      (IMP*)&o_dlPCS);
+    hookMethod(@"DownOperation", @"startNormalDownload",      (IMP)h_startNormal,(IMP*)&o_startNormal);
+    hookMethod(@"DownOperation", @"calucateDownloadSpeedLimit",(IMP)h_limit,     (IMP*)&o_limit);
+    hookMethod(@"DownOperation", @"speedUpToken",             (IMP)h_token,      (IMP*)&o_token);
+    hookMethod(@"BDPMDownloadOperation", @"setDlinkUrl:",      (IMP)h_setDlinkUrl,(IMP*)&o_setDlinkUrl);
+    hookMethod(@"BDPMFileDownloadModel", @"setDlink:",         (IMP)h_setDlink,   (IMP*)&o_setDlink);
+    hookMethod(@"BDPBridgeAlbumFileDlinkItem", @"setDlink:",   (IMP)h_setDlink,   (IMP*)&o_setDlink);
+    hookMethod(@"BDPanAccountInfo", @"isSVIP",                 (IMP)h_isSVIP,     (IMP*)&o_isSVIP);
+    hookMethod(@"BDPanActivityFloatWidget", @"setAdModel:",    (IMP)h_setAdModel, (IMP*)&o_setAdModel);
+
+    BNDebug(@"=== v5 ctor end ===");
 }
