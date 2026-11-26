@@ -1,11 +1,14 @@
 //
-//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v8)
+//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v9)
 //
-//  路线修正:
-//   - v6/v7 追 dlink dump 走偏了(DownOperation 实例里根本没有 dlink ivar, KVC/ivar 全取不到)。
-//   - 回到旧 BaiduSpeedBoost.dylib 验证过的限速方法族, 并补齐它 hook 的全部 9 个方法。
-//   - 去广告改用真正的总开关(BDPanPrologueAdManager.shouldSplashShow 等),
-//     之前 hook 的 isVipCanShowAdvertise 不是主开关, 所以一直有广告。
+//  v8 诊断: shouldSplashShow/isVipCanShowAdvertise 都 HIT 返回 NO 但广告还在
+//           -> 说明广告走的是"贴片/激励视频"路径, 不是开屏开关。
+//  v8 副作用: 只 hook isSVIP=YES, isBoughtSVip/vipLevel/有效期没配合,
+//            -> 会员页 V10/已购会员/有效期消失。
+//  v9 方案:
+//   1) 补全全套会员字段(isVIP/isBoughtSVip/vipLevel=10/有效期=2099 等), 修复会员页显示。
+//   2) 掐断真正的广告展示入口: showAdvertise(5类)/canShowRewardAlert/贴片广告启动方法。
+//   3) 保留限速方法族 + JSON 抓直链。
 //
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -28,9 +31,7 @@ static void BNAppend(NSString *file, NSString *line) {
 static void BNDebug(NSString *s) { BNAppend(@"bnt_debug.txt", s); }
 static void BNHit(NSString *tag) { BNAppend(@"bnt_hooks.txt", [NSString stringWithFormat:@"HIT %@", tag]); }
 
-/* ---------- JSON 响应抓 dlink (最可靠的直链来源) ---------- */
-// dlink 是服务器 JSON 响应里的字段, 不在下载对象的 ivar 里。
-// hook NSJSONSerialization 的解析结果, 递归扫描所有 "dlink"/"downloadlink" 等 key。
+/* ---------- JSON 响应抓 dlink ---------- */
 static BOOL BNIsLinkKey(NSString *k) {
     NSString *s = [k lowercaseString];
     return ([s isEqualToString:@"dlink"] || [s hasSuffix:@"dlink"] ||
@@ -56,14 +57,14 @@ static void BNScanJSON(id obj, int depth) {
 }
 
 /* ---------- 限速: 超大值 ---------- */
-// 旧 BaiduSpeedBoost.dylib 的核心: 把限速值换成极大 longLong。
-// 服务端限速改不了, 但本地这些策略方法返回超大值, 至少让 App 不再自己限速。
 static NSNumber *BNHuge(void) {
     static NSNumber *v = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ v = [NSNumber numberWithLongLong:1024LL * 1024 * 1024 * 1024]; });
     return v;
 }
+// 会员有效期: 2099-01-01 (double 时间戳)
+static double BNFutureTime(void) { return 4070908800.0; }
 
 /* ---------- 原函数指针 ---------- */
 static id  (*o_calcLimit)(id, SEL) = NULL;
@@ -76,39 +77,36 @@ static BOOL (*o_canSpeed)(id, SEL) = NULL;
 static BOOL (*o_keepOrigP)(id, SEL) = NULL;
 static BOOL (*o_keepOrigS)(id, SEL) = NULL;
 static BOOL (*o_hotUser)(id, SEL) = NULL;
-static BOOL (*o_isSVIP)(id, SEL) = NULL;
-static BOOL (*o_isVipAd)(id, SEL) = NULL;
-static BOOL (*o_shouldSplash)(id, SEL) = NULL;
-static BOOL (*o_hostSplash)(id, SEL) = NULL;
-static BOOL (*o_needFG)(id, SEL) = NULL;
-static BOOL (*o_fixNeedPlay)(id, SEL) = NULL;
-static void (*o_showAPISplash)(id, SEL, id) = NULL;
-static void (*o_showBrandSplash)(id, SEL, id) = NULL;
 static id (*o_JSONData)(id, SEL, id, unsigned long, id *) = NULL;
 static id (*o_JSONStream)(id, SEL, id, unsigned long, id *) = NULL;
 
-/* ---------- Hook 实现: 限速 ---------- */
+/* ---------- Hook: 限速 ---------- */
 static id h_calcLimit(id self, SEL _cmd) { BNHit(@"calcLimit"); return BNHuge(); }
 static id h_calcAllow(id self, SEL _cmd, BOOL a) { BNHit(@"calcAllow"); return BNHuge(); }
 static id h_downLimit(id self, SEL _cmd) { BNHit(@"downLoadSpeedLimit"); return BNHuge(); }
 static id h_p2pLimit(id self, SEL _cmd) { BNHit(@"p2pDownloadSpeedLimit"); return BNHuge(); }
 static long long h_fileLimit(id self, SEL _cmd) { BNHit(@"downloadFileSpeedLimit"); return 1024LL*1024*1024*1024; }
-static BOOL h_shouldAccess(id self, SEL _cmd) { BNHit(@"shouldAccessSpeedLimit"); return NO; }  // NO=不走限速
+static BOOL h_shouldAccess(id self, SEL _cmd) { BNHit(@"shouldAccessSpeedLimit"); return NO; }
 static BOOL h_canSpeed(id self, SEL _cmd) { BNHit(@"canSpeedUp"); return YES; }
 static BOOL h_keepOrig(id self, SEL _cmd) { BNHit(@"isKeepOriginalDownloadSpeed"); return YES; }
 static BOOL h_hotUser(id self, SEL _cmd) { BNHit(@"isHotUserLimit"); return NO; }
-static BOOL h_isSVIP(id self, SEL _cmd) { BNHit(@"isSVIP"); return YES; }
 
-/* ---------- Hook 实现: 去广告 ---------- */
-static BOOL h_isVipAd(id self, SEL _cmd) { BNHit(@"isVipCanShowAdvertise"); return NO; }
-static BOOL h_shouldSplash(id self, SEL _cmd) { BNHit(@"shouldSplashShow"); return NO; }   // 开屏总开关
-static BOOL h_hostSplash(id self, SEL _cmd) { BNHit(@"shouldHostControlSplashShow"); return NO; }
-static BOOL h_needFG(id self, SEL _cmd) { BNHit(@"needToShowSplashInForeground"); return NO; }
-static BOOL h_fixNeedPlay(id self, SEL _cmd) { BNHit(@"fixSplashNeedPlay"); return NO; }
-static void h_showAPISplash(id self, SEL _cmd, id vc) { BNHit(@"BDNCAPISplashAd.show"); /* block: 不调 orig */ }
-static void h_showBrandSplash(id self, SEL _cmd, id vc) { BNHit(@"BDNCBrandSplashAd.show"); /* block */ }
+/* ---------- Hook: 会员信息补全 (修复 V10/已购/有效期) ---------- */
+static BOOL h_yes(id self, SEL _cmd) { BNHit(NSStringFromSelector(_cmd)); return YES; }
+static long long h_vipLevel(id self, SEL _cmd) { BNHit(@"vipLevel"); return 10; }
+static double h_expire(id self, SEL _cmd) { BNHit(NSStringFromSelector(_cmd)); return BNFutureTime(); }
 
-/* ---------- Hook 实现: JSON 抓直链 ---------- */
+/* ---------- Hook: 广告展示入口 (真正掐断) ---------- */
+// showAdvertise 系列: v16@0:8, 不调 orig 直接阻断广告展示
+static void h_noShow(id self, SEL _cmd) { BNHit(NSStringFromSelector(_cmd)); /* block, 不调 orig */ }
+// 贴片广告启动: v28@0:8B16q20, 不调 orig
+static void h_noStartAd(id self, SEL _cmd, BOOL b, long long i) { BNHit(@"startAdvertise"); /* block */ }
+static BOOL h_noRewardAlert(id self, SEL _cmd) { BNHit(@"canShowRewardAlert"); return NO; }
+// 开屏广告(保留)
+static BOOL h_no(id self, SEL _cmd) { BNHit(NSStringFromSelector(_cmd)); return NO; }
+static void h_noShowVC(id self, SEL _cmd, id vc) { BNHit(NSStringFromSelector(_cmd)); /* block */ }
+
+/* ---------- Hook: JSON 抓直链 ---------- */
 static id h_JSONData(id self, SEL _cmd, id data, unsigned long opt, id *err) {
     id r = o_JSONData ? o_JSONData(self, _cmd, data, opt, err) : nil;
     if (r) { BNHit(@"JSONData"); BNScanJSON(r, 0); }
@@ -135,16 +133,16 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
 }
 
 %ctor {
-    NSString *mark = [NSString stringWithFormat:@"loaded(v8) %@\ndocs=%@\n", [NSDate date], BNDocs()];
+    NSString *mark = [NSString stringWithFormat:@"loaded(v9) %@\ndocs=%@\n", [NSDate date], BNDocs()];
     [mark writeToFile:BNPath(@"bnt_loaded.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *f in @[@"bnt_hooks.txt", @"bnt_debug.txt"]) {
         if (![fm fileExistsAtPath:BNPath(f)])
             [@"" writeToFile:BNPath(f) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
-    BNDebug(@"=== v8 ctor start ===");
+    BNDebug(@"=== v9 ctor start ===");
 
-    // === 限速方法族(旧 BaiduSpeedBoost.dylib 验证过的全部方法) ===
+    // === 限速方法族 ===
     hookMethod(@"DownOperation", @"calucateDownloadSpeedLimit",       (IMP)h_calcLimit,   (IMP*)&o_calcLimit);
     hookMethod(@"DownOperation", @"calucateDownloadSpeedLimitForAllow:",(IMP)h_calcAllow, (IMP*)&o_calcAllow);
     hookMethod(@"DownOperation", @"downLoadSpeedLimit",               (IMP)h_downLimit,   (IMP*)&o_downLimit);
@@ -156,17 +154,37 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
     hookMethod(@"SettingManage", @"isHotUserLimit",                   (IMP)h_hotUser,     (IMP*)&o_hotUser);
     hookMethod(@"PrivilegeModel", @"isKeepOriginalDownloadSpeed",     (IMP)h_keepOrig,    (IMP*)&o_keepOrigP);
 
-    // === SVIP + 去广告总开关 ===
-    hookMethod(@"BDPanAccountInfo", @"isSVIP",                        (IMP)h_isSVIP,      (IMP*)&o_isSVIP);
-    hookMethod(@"BDNCAdvertisesManage", @"isVipCanShowAdvertise",     (IMP)h_isVipAd,     (IMP*)&o_isVipAd);
-    hookMethod(@"BDPanPrologueAdManager", @"shouldSplashShow",        (IMP)h_shouldSplash, (IMP*)&o_shouldSplash);
-    hookMethod(@"BDPanPrologueAdManager", @"shouldHostControlSplashShow",(IMP)h_hostSplash,(IMP*)&o_hostSplash);
-    hookMethod(@"BDPanGlobalSplashAdvertiseManager", @"needToShowSplashInForeground",(IMP)h_needFG,(IMP*)&o_needFG);
-    hookMethod(@"BDPanVideoFixSplashAdvertiseHandler", @"needPlay",   (IMP)h_fixNeedPlay, (IMP*)&o_fixNeedPlay);
-    hookMethod(@"BDNCAPISplashAd", @"showSplashViewInRootViewController:",(IMP)h_showAPISplash,(IMP*)&o_showAPISplash);
-    hookMethod(@"BDNCBrandSplashAd", @"showSplashViewInRootViewController:",(IMP)h_showBrandSplash,(IMP*)&o_showBrandSplash);
+    // === 会员信息补全: 修复 V10/已购会员/有效期 ===
+    hookMethod(@"BDPanAccountInfo", @"isSVIP",            (IMP)h_yes,      NULL);
+    hookMethod(@"BDPanAccountInfo", @"isVIP",             (IMP)h_yes,      NULL);
+    hookMethod(@"BDPanAccountInfo", @"isBoughtSVip",      (IMP)h_yes,      NULL);
+    hookMethod(@"BDPanAccountInfo", @"isExVIP",           (IMP)h_yes,      NULL);
+    hookMethod(@"BDPanAccountInfo", @"isExSVIP",          (IMP)h_yes,      NULL);
+    hookMethod(@"BDPanAccountInfo", @"isExperienceVIP",   (IMP)h_yes,      NULL);
+    hookMethod(@"BDPanAccountInfo", @"spaceMember",       (IMP)h_yes,      NULL);
+    hookMethod(@"BDPanAccountInfo", @"showLevel",         (IMP)h_yes,      NULL);
+    hookMethod(@"BDPanAccountInfo", @"vipLevel",          (IMP)h_vipLevel, NULL);
+    hookMethod(@"BDPanAccountInfo", @"vipExpireTime",     (IMP)h_expire,   NULL);
+    hookMethod(@"BDPanAccountInfo", @"svipExpireTime",    (IMP)h_expire,   NULL);
 
-    // === JSON 响应抓 dlink (类方法, 用元类 hook) ===
+    // === 广告展示入口: 真正掐断 ===
+    // 贴片/播放广告启动
+    hookMethod(@"BDPanFlowPlayerAdvertiseView", @"startAdvertiseWithDisplayBottomPanel:index:", (IMP)h_noStartAd, NULL);
+    // 各类 showAdvertise
+    hookMethod(@"BDNCFlowPlayerAdBaseBiddingTask", @"showAdvertise", (IMP)h_noShow, NULL);
+    hookMethod(@"BDNCRewardVideoAdBaseTask", @"showAdvertise", (IMP)h_noShow, NULL);
+    hookMethod(@"BDNCGroMoreRewardVideoAdTask", @"showAdvertise", (IMP)h_noShow, NULL);
+    hookMethod(@"BDNCCacheRewardVideoAdTask", @"showAdvertise", (IMP)h_noShow, NULL);
+    hookMethod(@"BDNCCommerceRewardVideoAdTask", @"showAdvertise", (IMP)h_noShow, NULL);
+    hookMethod(@"BDNCRewardVideoAdAlertHandler", @"canShowRewardAlert", (IMP)h_noRewardAlert, NULL);
+    // 开屏(保留)
+    hookMethod(@"BDNCAdvertisesManage", @"isVipCanShowAdvertise", (IMP)h_no, NULL);
+    hookMethod(@"BDPanPrologueAdManager", @"shouldSplashShow", (IMP)h_no, NULL);
+    hookMethod(@"BDPanGlobalSplashAdvertiseManager", @"needToShowSplashInForeground", (IMP)h_no, NULL);
+    hookMethod(@"BDNCAPISplashAd", @"showSplashViewInRootViewController:", (IMP)h_noShowVC, NULL);
+    hookMethod(@"BDNCBrandSplashAd", @"showSplashViewInRootViewController:", (IMP)h_noShowVC, NULL);
+
+    // === JSON 响应抓 dlink (类方法, 元类 hook) ===
     Class jsonMeta = objc_getMetaClass("NSJSONSerialization");
     if (jsonMeta) {
         SEL s1 = NSSelectorFromString(@"JSONObjectWithData:options:error:");
@@ -177,5 +195,5 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
         if (m2) { MSHookMessageEx(jsonMeta, s2, (IMP)h_JSONStream, (IMP*)&o_JSONStream); BNDebug(@"HOOK NSJSONSerialization.stream OK"); }
     }
 
-    BNDebug(@"=== v8 ctor end ===");
+    BNDebug(@"=== v9 ctor end ===");
 }
