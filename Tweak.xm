@@ -1,27 +1,32 @@
 //
-//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强（All-in-One v3）
+//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强（All-in-One v4）
 //
 //  功能:
-//    1) SVIP 标志 + 完整去广告（一比一还原原 baidudisk.dylib，含所有广告管理类）
-//    2) 拦截真实下载直链(dlink)写到 App 沙盒 Documents，供多线程下载器使用
+//    1) SVIP 标志 + 完整去广告（一比一还原原 baidudisk.dylib）
+//    2) 抓真实下载直链(dlink)到 App 沙盒 Documents，供多线程下载器使用
 //
-//  写文件位置: App 沙盒 Documents（NSSearchPathForDirectoriesInDomains），
-//              Filza 路径形如 /var/mobile/Containers/Data/Application/<UUID>/Documents/
-//              同时写一个加载标记 bnt_loaded.txt 用于确认 tweak 是否注入成功。
+//  v4 变更: 系统层 NSURLSession/NSURLConnection hook 抓不到（13.35.5 走自研网络库）。
+//           改为直接 hook 百度自己的下载类:
+//             BDPMDownloadOperation.setDlinkUrl:   / startDownTaskUrl:
+//             BDPMFileDownloadModel.setDlink:
+//             BDPBridgeAlbumFileDlinkItem.setDlink:
+//             DownOperation.downWithServerFullPath:localFullPath:downsize:
+//           无论底层网络怎么封装，直链必定流经这些入口。
+//           另写 bnt_hooks.txt 记录哪个 hook 命中，便于诊断。
 //
-
+//  写文件位置: App 沙盒 Documents (NSSearchPathForDirectoriesInDomains)
+//
 #import <Foundation/Foundation.h>
 
-// App 沙盒 Documents —— App 自己一定有权写
 static NSString *BNDocs(void) {
     NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     return (p.count ? p[0] : @"/var/mobile/Documents");
 }
-static NSString *BNLinksFile(void) { return [BNDocs() stringByAppendingPathComponent:@"baidu_links.txt"]; }
-static NSString *BNDetailFile(void) { return [BNDocs() stringByAppendingPathComponent:@"baidu_dlinks.txt"]; }
-static NSString *BNMarkerFile(void) { return [BNDocs() stringByAppendingPathComponent:@"bnt_loaded.txt"]; }
+static NSString *BNLinksFile(void)   { return [BNDocs() stringByAppendingPathComponent:@"baidu_links.txt"]; }
+static NSString *BNDetailFile(void)  { return [BNDocs() stringByAppendingPathComponent:@"baidu_dlinks.txt"]; }
+static NSString *BNMarkerFile(void)  { return [BNDocs() stringByAppendingPathComponent:@"bnt_loaded.txt"]; }
+static NSString *BNHookFile(void)    { return [BNDocs() stringByAppendingPathComponent:@"bnt_hooks.txt"]; }
 
-// 只抓真正的下载 CDN / 下载接口
 static BOOL BNIsDownloadURL(NSURL *u) {
     if (!u) return NO;
     NSString *s = [[u absoluteString] lowercaseString];
@@ -42,6 +47,27 @@ static void BNAppendText(NSString *path, NSString *line) {
     if ([old rangeOfString:line].location != NSNotFound) return;
     NSString *ns = old.length ? [old stringByAppendingFormat:@"\n%@", line] : line;
     [ns writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+// 记录 hook 命中（诊断：确认类级 hook 是否真的触发）
+static void BNMarkHook(NSString *tag) {
+    BNAppendText(BNHookFile(), [NSString stringWithFormat:@"HIT %@", tag]);
+}
+
+// 通用：把一个可能是 URL 的对象写文件（NSString / NSURL 都支持）
+static void BNRecordURL(id obj, NSString *tag) {
+    BNMarkHook(tag);
+    NSString *s = nil;
+    if ([obj isKindOfClass:[NSString class]]) s = (NSString *)obj;
+    else if ([obj isKindOfClass:[NSURL class]]) s = [(NSURL *)obj absoluteString];
+    if (!s.length) return;
+    if ([s hasPrefix:@"http://"] || [s hasPrefix:@"https://"]) {
+        BNAppendText(BNLinksFile(), s);
+        BNAppendText(BNDetailFile(), [NSString stringWithFormat:@"%@\t[%@]", s, tag]);
+    } else {
+        // 非完整 URL（如 serverFullPath）也记录，便于诊断
+        BNAppendText(BNDetailFile(), [NSString stringWithFormat:@"RAW(%@): %@", tag, s]);
+    }
 }
 
 static void BNHandleRequest(NSURLRequest *req) {
@@ -72,7 +98,6 @@ static void BNHandleRequest(NSURLRequest *req) {
 - (void)setSplashWindow:(id)a { %orig(nil); }
 %end
 
-// 角标：原 dylib 置 nil，值参数置 0/nil
 %hook BDPanPersonHeaderView
 - (void)setTabBadgeNumber:(id)a maxNumber:(id)b atIndex:(NSInteger)i { %orig(nil, nil, i); }
 %end
@@ -81,12 +106,11 @@ static void BNHandleRequest(NSURLRequest *req) {
 - (void)setTabBadgeNumber:(id)a maxNumber:(id)b atIndex:(NSInteger)i { %orig(nil, nil, i); }
 %end
 
-// 广告数据管理类
 %hook BDNCAdvertiseDataManage
 - (void)setupViews { %orig; }
 %end
 
-#pragma mark - 2. 网络层抓直链
+#pragma mark - 2a. 系统网络层（兜底，v3 保留）
 
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r { BNHandleRequest(r); return %orig; }
@@ -106,14 +130,40 @@ static void BNHandleRequest(NSURLRequest *req) {
 - (id)initWithRequest:(NSURLRequest *)r delegate:(id)del { BNHandleRequest(r); return %orig; }
 %end
 
+#pragma mark - 2b. 百度自研下载类（v4 核心：直链必经入口）
+
+%hook BDPMDownloadOperation
+// 直链 setter：服务器返回 dlink 后写入
+- (void)setDlinkUrl:(id)url { BNRecordURL(url, @"BDPMDownloadOperation.setDlinkUrl"); %orig; }
+// 下载任务启动：直接拿到要下载的 URL
+- (void)startDownTaskUrl:(id)url { BNRecordURL(url, @"BDPMDownloadOperation.startDownTaskUrl"); %orig; }
+%end
+
+%hook BDPMFileDownloadModel
+- (void)setDlink:(id)url { BNRecordURL(url, @"BDPMFileDownloadModel.setDlink"); %orig; }
+%end
+
+%hook BDPBridgeAlbumFileDlinkItem
+- (void)setDlink:(id)url { BNRecordURL(url, @"BDPBridgeAlbumFileDlinkItem.setDlink"); %orig; }
+%end
+
+%hook DownOperation
+// serverFullPath 是下载源路径，部分场景直接是完整 URL
+- (void)downWithServerFullPath:(id)path localFullPath:(id)local downsize:(long long)size {
+    BNRecordURL(path, @"DownOperation.downWithServerFullPath");
+    %orig;
+}
+%end
+
 %ctor {
-    // 加载标记：证明 tweak 已注入并运行
-    NSString *mark = [NSString stringWithFormat:@"loaded %@\ndocs=%@\n", [NSDate date], BNDocs()];
+    NSString *mark = [NSString stringWithFormat:@"loaded(v4) %@\ndocs=%@\n", [NSDate date], BNDocs()];
     [mark writeToFile:BNMarkerFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    // 预建空文件，Filza 直接可见
-    if (![[NSFileManager defaultManager] fileExistsAtPath:BNLinksFile()])
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:BNLinksFile()])
         [@"" writeToFile:BNLinksFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:BNDetailFile()])
+    if (![fm fileExistsAtPath:BNDetailFile()])
         [@"" writeToFile:BNDetailFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    NSLog(@"[BNDTools] v3 loaded. docs=%@", BNDocs());
+    if (![fm fileExistsAtPath:BNHookFile()])
+        [@"bnt_hooks: which dlink hook fired\n" writeToFile:BNHookFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSLog(@"[BNDTools] v4 loaded. docs=%@", BNDocs());
 }
