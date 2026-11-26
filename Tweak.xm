@@ -1,5 +1,5 @@
 //
-//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v9)
+//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v10)
 //
 //  v8 诊断: shouldSplashShow/isVipCanShowAdvertise 都 HIT 返回 NO 但广告还在
 //           -> 说明广告走的是"贴片/激励视频"路径, 不是开屏开关。
@@ -38,6 +38,27 @@ static BOOL BNIsLinkKey(NSString *k) {
             [s rangeOfString:@"dlink"].location != NSNotFound ||
             [s isEqualToString:@"downloadlink"] || [s isEqualToString:@"downloadurl"]);
 }
+// 真实文件直链 vs App 资源包: 只导出 d.pcs.baidu.com 的到干净文件
+static void BNRecordLink(NSString *link) {
+    BNAppend(@"baidu_links.txt", link);  // 原始全量(兼容旧版)
+    if ([link rangeOfString:@"d.pcs.baidu.com/file/"].location != NSNotFound ||
+        [link rangeOfString:@"d-drive.pcs.baidu.com"].location != NSNotFound) {
+        BNAppend(@"baidu_real_dlinks.txt", link);  // 干净直链
+    }
+}
+// 导出 Cookie + UA (dlink 绑定登录态, 外部下载器必须带上)
+static void BNExportCookies(void) {
+    NSMutableString *hdr = [NSMutableString string];
+    NSHTTPCookieStorage *store = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    for (NSHTTPCookie *c in [store cookies]) {
+        NSString *dom = [c domain] ?: @"";
+        if ([dom rangeOfString:@"baidu"].location == NSNotFound) continue;
+        [hdr appendFormat:@"%@=%@; ", [c name], [c value]];
+    }
+    [hdr writeToFile:BNPath(@"baidu_cookie.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *ua = @"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 netdisk_iPhone/13.35.5";
+    [ua writeToFile:BNPath(@"baidu_ua.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
 static void BNScanJSON(id obj, int depth) {
     if (!obj || depth > 8) return;
     if ([obj isKindOfClass:[NSDictionary class]]) {
@@ -47,7 +68,7 @@ static void BNScanJSON(id obj, int depth) {
             id v = [d objectForKey:key];
             if (BNIsLinkKey(key) && [v isKindOfClass:[NSString class]]) {
                 NSString *link = (NSString *)v;
-                if ([link hasPrefix:@"http"]) BNAppend(@"baidu_links.txt", link);
+                if ([link hasPrefix:@"http"]) { BNRecordLink(link); BNExportCookies(); }
             }
             BNScanJSON(v, depth + 1);
         }
@@ -133,14 +154,14 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
 }
 
 %ctor {
-    NSString *mark = [NSString stringWithFormat:@"loaded(v9) %@\ndocs=%@\n", [NSDate date], BNDocs()];
+    NSString *mark = [NSString stringWithFormat:@"loaded(v10) %@\ndocs=%@\n", [NSDate date], BNDocs()];
     [mark writeToFile:BNPath(@"bnt_loaded.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *f in @[@"bnt_hooks.txt", @"bnt_debug.txt"]) {
+    for (NSString *f in @[@"bnt_hooks.txt", @"bnt_debug.txt", @"baidu_real_dlinks.txt", @"baidu_cookie.txt", @"baidu_ua.txt"]) {
         if (![fm fileExistsAtPath:BNPath(f)])
             [@"" writeToFile:BNPath(f) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
-    BNDebug(@"=== v9 ctor start ===");
+    BNDebug(@"=== v10 ctor start ===");
 
     // === 限速方法族 ===
     hookMethod(@"DownOperation", @"calucateDownloadSpeedLimit",       (IMP)h_calcLimit,   (IMP*)&o_calcLimit);
@@ -195,5 +216,5 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
         if (m2) { MSHookMessageEx(jsonMeta, s2, (IMP)h_JSONStream, (IMP*)&o_JSONStream); BNDebug(@"HOOK NSJSONSerialization.stream OK"); }
     }
 
-    BNDebug(@"=== v9 ctor end ===");
+    BNDebug(@"=== v10 ctor end ===");
 }
