@@ -50,7 +50,6 @@ static NSString *BDSerializeRequest(NSURLRequest *req) {
 }
 
 static void BDAppendLine(NSString *line) {
-    NSFileManager *fm = [NSFileManager defaultManager];
     NSString *content = [NSString stringWithContentsOfFile:kOutPath encoding:NSUTF8StringEncoding error:nil];
     if (!content) content = @"";
     // 去重: 同一条直链不重复写
