@@ -1,4 +1,4 @@
-# Theos Makefile — BaiduSpeedBoost
+# Theos Makefile — BaiduNetdiskTools (All-in-One)
 # 目标: iOS 15.0+ arm64 (与 13.35.5 的 MinimumOSVersion=15.0 一致)
 
 TARGET := iphone:clang:latest:15.0
@@ -7,10 +7,10 @@ ARCHS := arm64
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = BaiduSpeedBoost
-BaiduSpeedBoost_FILES = Tweak.xm
-BaiduSpeedBoost_CFLAGS = -fobjc-arc -Wno-unused-parameter
-BaiduSpeedBoost_FRAMEWORKS = Foundation
+TWEAK_NAME = BaiduNetdiskTools
+BaiduNetdiskTools_FILES = Tweak.xm
+BaiduNetdiskTools_CFLAGS = -fobjc-arc -Wno-unused-parameter
+BaiduNetdiskTools_FRAMEWORKS = Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
