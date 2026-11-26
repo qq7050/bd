@@ -59,13 +59,20 @@ static void BNDumpIvars(id obj, NSString *tag) {
         if (!cn) continue;
         NSString *name = [NSString stringWithUTF8String:cn];
         if (!BNInterestingIvar(name)) continue;
+        // 关键修复: 只读对象类型(@)的 ivar。基本类型(BOOL/int/struct)用 object_getIvar
+        // 会当对象指针读, 后续 isKindOfClass 解引用野指针 -> 崩溃(闪退根因)。
+        // 基本类型值(_dlinkExpiresAt/_dlinkHttptag/_downloadImageFromDlink等)直接跳过。
+        const char *type = ivar_getTypeEncoding(ivars[i]);
+        if (!type || type[0] != '@') continue;
+        if (type[1] == '?') continue;  // block 也跳过
         id val = nil;
         @try { val = object_getIvar(obj, ivars[i]); } @catch (NSException *e) { continue; }
+        if (!val) continue;
         NSString *s = nil;
         if ([val isKindOfClass:[NSString class]]) s = (NSString *)val;
         else if ([val isKindOfClass:[NSURL class]]) s = [(NSURL *)val absoluteString];
         else if ([val isKindOfClass:[NSNumber class]]) s = [val stringValue];
-        else if (val) s = [val description];
+        else s = nil;  // 其它对象不调 description, 避免未知对象崩溃
         if (!s.length) continue;
         [report appendFormat:@"\n  %@ = %@", name, s];
         if ([s hasPrefix:@"http"]) BNUrl(s, [NSString stringWithFormat:@"%@.%@", tag, name]);
@@ -155,7 +162,8 @@ static BOOL h_isSVIP(id self, SEL _cmd) { BNHit(@"BDPanAccountInfo.isSVIP"); ret
 static BOOL h_isVipAd(id self, SEL _cmd) { BNHit(@"isVipCanShowAdvertise"); return NO; }
 static void h_setAdModel(id self, SEL _cmd, id a) {
     BNHit(@"BDNCAdvertiseDataManage.setAdModel");
-    if (o_setAdModel) o_setAdModel(self, _cmd, nil);
+    // 传原值给 orig, 不置 nil(置 nil 可能让 orig 内部解引用崩溃)。去广告靠 isVipCanShowAdvertise=NO
+    if (o_setAdModel) o_setAdModel(self, _cmd, a);
 }
 static void h_setupAlert(id self, SEL _cmd) {
     BNHit(@"BDPanAdvertiseVideoAlertViewController.setupAlertView");
