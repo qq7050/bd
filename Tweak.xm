@@ -1,127 +1,148 @@
 //
-//  BaiduSpeedBoost — 百度网盘 iOS 13.35.5 本地限速链补强
-//  目标 App: com.baidu.netdisk (netdisk_iPhone, 13.35.5.6)
+//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强（All-in-One）
 //
-//  设计原则（重要）:
-//  1) 只 hook 已在 13.35.5 二进制中实测确认存在的方法（类名/方法名/类型编码均来自 IPA 逆向）。
-//  2) 不碰 speedUpToken / 反作弊类（BDPanDownloadAnticheatProtocol / BDPanJailbreakDetectTool 等）——
-//     这些是服务端校验与风控，本地伪造无效且有黑号风险。
-//  3) 限速值采用"保底抬升"而非"硬编码覆盖": 服务端下发的值若高于阈值则原样放行，
-//     只有低于阈值（典型非会员 100KB/s）时才抬到阈值。这样保留会员/加速通道的真实高速。
-//  4) 所有 hook 都保留原实现调用（%orig），仅修正返回值，降低崩溃与安全模式风险。
+//  为什么改版:
+//    旧版 BaiduSpeedBoost 只 hook 客户端限速数值, 但百度下载带宽是服务端按账号
+//    等级下发的, 本地改数值堵不住 CDN 闸门 —— 实测两个 dylib 都注入仍无加速。
+//    本版删除无效的限速数值 hook, 改为导出服务端签发的真实下载直链(dlink),
+//    交给多线程下载器(Alook / 1DM / aria2)突破单连接限速。
 //
-//  注意: 本 tweak 不修改 isSVIP/vipLevel——你的 baidudisk.dylib 已做（isSVIP=YES, vipLevel=10）。
-//        本 tweak 与它叠加生效，负责"会员标志之后"的限速数值链。
+//  功能:
+//    1) 保留原 baidudisk.dylib 的 SVIP 标志 + 去广告(看高清/去广告继续有效)
+//    2) 拦截 NSURLSession / NSURLConnection 的下载请求, 把含签名的真实直链
+//       连同请求头写入 /var/mobile/Documents/baidu_dlinks.txt, 供外部多线程下载
+//
+//  重要: 直链带时效(通常十几分钟~数小时)且绑定 Cookie/UA, 导出后尽快用,
+//        用 Filza 复制整行到下载器, 并保留 headers 里的 Cookie/User-Agent。
 //
 
 #import <Foundation/Foundation.h>
 
-// ===== 可调参数 =====
-// 下载速度下限（字节/秒）。8 * 1024 * 1024 = 8 MB/s。
-// 若你希望更激进可调到 20MB/s；设 0 则完全关闭"数值保底"，只保留开关类 hook。
-static const long long kSpeedFloorBytesPerSec = 8LL * 1024LL * 1024LL;
+static NSString *const kOutPath = @"/var/mobile/Documents/baidu_dlinks.txt";
+static NSString *const kLinkFile = @"/var/mobile/Documents/baidu_links.txt";
 
-// 优先使用二进制里实测的 ivar/方法；若某些方法在个别小版本签名不同，用 respondsToSelector 兜底。
-
-// 把任意 NSNumber / 数值对象规整为 long long
-static inline long long BDNumValue(id v) {
-    if (!v) return 0;
-    if ([v isKindOfClass:[NSNumber class]]) return [v longLongValue];
-    if ([v respondsToSelector:@selector(longLongValue)]) return [v longLongValue];
-    return 0;
-}
-
-// 数值型限速保底：低于阈值抬到阈值，高于阈值原样返回
-static inline id BDFloorNumber(id orig) {
-    if (kSpeedFloorBytesPerSec <= 0) return orig;
-    long long v = BDNumValue(orig);
-    if (v < kSpeedFloorBytesPerSec) {
-        return [NSNumber numberWithLongLong:kSpeedFloorBytesPerSec];
+// 只抓真正的下载 CDN / 下载接口, 不碰登录/API 流量
+static BOOL BDISDownloadURL(NSURL *u) {
+    if (!u) return NO;
+    NSString *s = [[u absoluteString] lowercaseString];
+    if ([s containsString:@"d.pcs.baidu.com"] ||
+        [s containsString:@"d-drive.pcs.baidu.com"] ||
+        [s containsString:@"issuecdn.baidupcs.com"] ||
+        [s containsString:@"sdata.baidupcs.com"] ||
+        [s containsString:@"netdisk-wps.baidupcs.com"] ||
+        [s containsString:@"cdndoc.pcs.baidu.com"] ||
+        [s containsString:@"/rest/2.0/pcs/file"] ||
+        [s containsString:@"method=download"]) {
+        return YES;
     }
-    return orig;
-}
-
-// 原始 long long 保底
-static inline long long BDFloorLongLong(long long v) {
-    if (kSpeedFloorBytesPerSec <= 0) return v;
-    return v < kSpeedFloorBytesPerSec ? kSpeedFloorBytesPerSec : v;
-}
-
-#pragma mark - 1. CDN 限速开关（实测纯 ivar getter，最干净的 hook 点）
-// 类型编码 B16@0:8 → BOOL，无参。关闭 CDN 层限速准入。
-%hook CDNRequestModel
-- (BOOL)shouldAccessSpeedLimit {
-    // NO = 不施加 CDN 限速
     return NO;
 }
+
+// 把请求序列化成一行可复制文本: URL 【TAB】 Header1: v1 【TAB】 ...
+static NSString *BDSerializeRequest(NSURLRequest *req) {
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:req.URL.absoluteString ?: @""];
+    NSDictionary *h = req.allHTTPHeaderFields;
+    for (NSString *k in h) {
+        [out appendFormat:@"\t%@: %@", k, [h objectForKey:k]];
+    }
+    return out;
+}
+
+static void BDAppendLine(NSString *line) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *content = [NSString stringWithContentsOfFile:kOutPath encoding:NSUTF8StringEncoding error:nil];
+    if (!content) content = @"";
+    // 去重: 同一条直链不重复写
+    if ([content rangeOfString:line].location != NSNotFound) return;
+    NSString *ns = [content length] ? [content stringByAppendingFormat:@"\n%@", line] : line;
+    [ns writeToFile:kOutPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+// 额外: 只写纯 URL 列表, 方便直接复制
+static void BDAppendUrl(NSString *url) {
+    NSString *content = [NSString stringWithContentsOfFile:kLinkFile encoding:NSUTF8StringEncoding error:nil];
+    if (!content) content = @"";
+    if ([content rangeOfString:url].location != NSNotFound) return;
+    NSString *ns = [content length] ? [content stringByAppendingFormat:@"\n%@", url] : url;
+    [ns writeToFile:kLinkFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void BDHandleRequest(NSURLRequest *req) {
+    if (!BDISDownloadURL(req.URL)) return;
+    NSString *url = req.URL.absoluteString;
+    if (![url length]) return;
+    BDAppendUrl(url);
+    BDAppendLine(BDSerializeRequest(req));
+    NSLog(@"[BNDTools] dlink captured: %@", [url substringToIndex:MIN((NSUInteger)160, [url length])]);
+}
+
+#pragma mark - 1. SVIP + 去广告（保留原 baidudisk.dylib 功能）
+
+%hook BDPanAccountInfo
+- (BOOL)isSVIP { return YES; }
+- (BOOL)isVipCanShowAdvertise { return NO; }
+- (NSInteger)vipLevel { return 10; }
 %end
 
-#pragma mark - 2. 下载任务限速计算（DownOperation）
-// 类型编码 @16@0:8 → 返回 NSNumber；@20@0:8B16 → 带 BOOL 参数。
-%hook DownOperation
-- (id)calucateDownloadSpeedLimit {
-    id orig = %orig;
-    return BDFloorNumber(orig);
-}
+%hook BDPanActivityFloatWidget
+- (void)setAdModel:(id)arg1 { %orig(nil); }
+%end
 
-- (id)calucateDownloadSpeedLimitForAllow:(BOOL)allow {
-    id orig = %orig(allow);
-    return BDFloorNumber(orig);
-}
+%hook BDPanHridWebViewController
+- (void)setSplashWindow:(id)arg1 { %orig(nil); }
+%end
 
-// 允许加速开关（B16@0:8）
-- (BOOL)canSpeedUp {
-    return YES;
-}
+%hook BDPanPersonHeaderView
+- (void)setTabBadgeNumber:(id)arg1 maxNumber:(id)arg2 atIndex:(id)arg3 { %orig(nil, nil, arg3); }
+%end
 
-// downLoadSpeedLimit / setDownLoadSpeedLimit: 为 ivar 存取（@16@0:8 / v24@0:8@16）
-// 读时保底；setter 放行原值，避免破坏内部状态一致性。
-- (id)downLoadSpeedLimit {
-    id orig = %orig;
-    return BDFloorNumber(orig);
+%hook BDPanPersonalWalletSection
+- (void)setTabBadgeNumber:(id)arg1 maxNumber:(id)arg2 atIndex:(id)arg3 { %orig(nil, nil, arg3); }
+%end
+
+#pragma mark - 2. 网络层抓真实下载直链
+
+%hook NSURLSession
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)req {
+    BDHandleRequest(req);
+    return %orig;
+}
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)req {
+    BDHandleRequest(req);
+    return %orig;
+}
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url {
+    if (BDISDownloadURL(url)) {
+        NSURLRequest *r = [NSURLRequest requestWithURL:url];
+        BDHandleRequest(r);
+    }
+    return %orig;
+}
+- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url {
+    if (BDISDownloadURL(url)) {
+        NSURLRequest *r = [NSURLRequest requestWithURL:url];
+        BDHandleRequest(r);
+    }
+    return %orig;
 }
 %end
 
-#pragma mark - 3. P2P 下载限速（CloudP2PCommandModel）
-// downloadSpeedLimit 类型 @16@0:8 → NSNumber
-%hook CloudP2PCommandModel
-- (id)downloadSpeedLimit {
-    id orig = %orig;
-    return BDFloorNumber(orig);
+%hook NSURLConnection
++ (NSURLConnection *)connectionWithRequest:(NSURLRequest *)req delegate:(id)del {
+    BDHandleRequest(req);
+    return %orig;
+}
+- (id)initWithRequest:(NSURLRequest *)req delegate:(id)del {
+    BDHandleRequest(req);
+    return %orig;
 }
 %end
 
-#pragma mark - 4. 全局限速设置（SettingManage）
-// downloadFileSpeedLimit 类型 q16@0:8 → long long
-// speedLimitLevel 类型 q16@0:8 → 限速等级（不确定映射区间，故只抬数值不降级）
-%hook SettingManage
-- (long long)downloadFileSpeedLimit {
-    long long orig = %orig;
-    return BDFloorLongLong(orig);
-}
-
-// 保留原始下载速度（不转码降速）开关（B16@0:8）
-- (BOOL)isKeepOriginalDownloadSpeed {
-    return YES;
-}
-
-// 热门用户限速判定（B16@0:8）——返回 NO 避开热点用户额外限速
-- (BOOL)isHotUserLimit {
-    return NO;
-}
-%end
-
-#pragma mark - 5. 会员权益限速档（PrivilegeModel）
-// isKeepOriginalDownloadSpeed 类型 B16@0:8
-// speedLimitLevel 类型 q16@0:8 —— 会员等级换算的限速档，配合 isSVIP=10 已足够，
-// 这里不改等级（避免破坏其他权益判断），仅开"保留原速"。
-%hook PrivilegeModel
-- (BOOL)isKeepOriginalDownloadSpeed {
-    return YES;
-}
-%end
-
-// ===== 印象笔记/系统事件回调留空，避免日志泄露判断逻辑 =====
 %ctor {
-    NSLog(@"[BaiduSpeedBoost] loaded. floor=%lld B/s, target=com.baidu.netdisk 13.35.5", kSpeedFloorBytesPerSec);
+    // 初始化空文件, 便于 Filza 直接找到
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:kOutPath]) [@"" writeToFile:kOutPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (![fm fileExistsAtPath:kLinkFile]) [@"" writeToFile:kLinkFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSLog(@"[BNDTools] loaded. dlink -> %@", kOutPath);
 }
