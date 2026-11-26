@@ -48,40 +48,65 @@ static BOOL BNInterestingIvar(NSString *name) {
     for (NSString *k in kw) if ([s rangeOfString:k].location != NSNotFound) return YES;
     return NO;
 }
+// 把一个值转成安全字符串(NSString/NSURL/NSNumber), 其它对象一律不碰
+static NSString *BNSafeString(id val) {
+    if ([val isKindOfClass:[NSString class]]) return (NSString *)val;
+    if ([val isKindOfClass:[NSURL class]]) return [(NSURL *)val absoluteString];
+    if ([val isKindOfClass:[NSNumber class]]) return [(NSNumber *)val stringValue];
+    return nil;
+}
+static void BNRecordField(NSString *tag, NSString *name, NSString *s) {
+    if (!s.length) return;
+    BNAppend(@"bnt_debug.txt", [NSString stringWithFormat:@"  %@.%@ = %@", tag, name, s]);
+    if ([s hasPrefix:@"http"]) BNUrl(s, [NSString stringWithFormat:@"%@.%@", tag, name]);
+    if ([name rangeOfString:@"serverfullpath" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+        [name rangeOfString:@"cdnpath" options:NSCaseInsensitiveSearch].location != NSNotFound)
+        BNAppend(@"baidu_dlinks.txt", [NSString stringWithFormat:@"PATH(%@.%@): %@", tag, name, s]);
+}
 static void BNDumpIvars(id obj, NSString *tag) {
     if (!obj) return;
-    Class cls = object_getClass(obj);
-    NSMutableString *report = [NSMutableString stringWithFormat:@"IVARS[%@] class=%@", tag, cls];
-    unsigned int n = 0;
-    Ivar *ivars = class_copyIvarList(cls, &n);
-    for (unsigned int i = 0; i < n; i++) {
-        const char *cn = ivar_getName(ivars[i]);
-        if (!cn) continue;
-        NSString *name = [NSString stringWithUTF8String:cn];
-        if (!BNInterestingIvar(name)) continue;
-        // 关键修复: 只读对象类型(@)的 ivar。基本类型(BOOL/int/struct)用 object_getIvar
-        // 会当对象指针读, 后续 isKindOfClass 解引用野指针 -> 崩溃(闪退根因)。
-        // 基本类型值(_dlinkExpiresAt/_dlinkHttptag/_downloadImageFromDlink等)直接跳过。
-        const char *type = ivar_getTypeEncoding(ivars[i]);
-        if (!type || type[0] != '@') continue;
-        if (type[1] == '?') continue;  // block 也跳过
+    BNAppend(@"bnt_debug.txt", [NSString stringWithFormat:@"DUMP BEGIN [%@] class=%@", tag, object_getClass(obj)]);
+
+    // 方法1: KVC 取值(最安全, 自动搜索父类, 基本类型返回NSNumber包装不崩)
+    // 直接按已知 key 取, 覆盖 dlink / serverFullPath / CDN 路径等全部关键字段
+    NSArray *keys = @[@"dlink", @"dlinkUrl", @"dLink", @"dlinkURL",
+                      @"serverFullPath", @"fileServerFullPath", @"associatedServerFullPath",
+                      @"downloadCDNHost", @"downloadCDNPath", @"downloadCDNServerList", @"downloadCDNClientIp",
+                      @"downloadUrl", @"downloadURL", @"downloadLink", @"downLoadLink",
+                      @"dlinkVideoExt", @"dlinkVideoFileId", @"dlinkVideoStoryId",
+                      @"encrypt_dlink", @"taskDownloadUrl", @"currentDownUrlArray"];
+    for (NSString *k in keys) {
         id val = nil;
-        @try { val = object_getIvar(obj, ivars[i]); } @catch (NSException *e) { continue; }
-        if (!val) continue;
-        NSString *s = nil;
-        if ([val isKindOfClass:[NSString class]]) s = (NSString *)val;
-        else if ([val isKindOfClass:[NSURL class]]) s = [(NSURL *)val absoluteString];
-        else if ([val isKindOfClass:[NSNumber class]]) s = [val stringValue];
-        else s = nil;  // 其它对象不调 description, 避免未知对象崩溃
-        if (!s.length) continue;
-        [report appendFormat:@"\n  %@ = %@", name, s];
-        if ([s hasPrefix:@"http"]) BNUrl(s, [NSString stringWithFormat:@"%@.%@", tag, name]);
-        // serverFullPath 不是 http, 但也记录(可用于构造直链)
-        if ([name rangeOfString:@"serverfullpath" options:NSCaseInsensitiveSearch].location != NSNotFound)
-            BNAppend(@"baidu_dlinks.txt", [NSString stringWithFormat:@"SERVERPATH(%@): %@", tag, s]);
+        @try { val = [obj valueForKey:k]; }
+        @catch (NSException *e) { continue; }
+        NSString *s = BNSafeString(val);
+        BNRecordField(tag, k, s);
     }
-    free(ivars);
-    BNDebug(report);
+
+    // 方法2: 逐层遍历继承链的 ivar, 只取对象类型(@)且非block, 避免野指针崩溃
+    Class cls = object_getClass(obj);
+    int depth = 0;
+    while (cls && depth < 8) {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(cls, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *cn = ivar_getName(ivars[i]);
+            if (!cn) continue;
+            NSString *name = [NSString stringWithUTF8String:cn];
+            if (!BNInterestingIvar(name)) continue;
+            const char *type = ivar_getTypeEncoding(ivars[i]);
+            if (!type || type[0] != '@' || type[1] == '?') continue;  // 跳过基本类型/block
+            id val = nil;
+            @try { val = object_getIvar(obj, ivars[i]); }
+            @catch (NSException *e) { continue; }
+            NSString *s = BNSafeString(val);
+            if (s.length) BNRecordField(tag, [NSString stringWithFormat:@"ivar:%@", name], s);
+        }
+        free(ivars);
+        cls = class_getSuperclass(cls);
+        depth++;
+    }
+    BNAppend(@"bnt_debug.txt", [NSString stringWithFormat:@"DUMP END [%@] depth=%d", tag, depth]);
 }
 
 /* ---------- 原函数指针 ---------- */
@@ -190,7 +215,7 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
 }
 
 %ctor {
-    NSString *mark = [NSString stringWithFormat:@"loaded(v6) %@\ndocs=%@\n", [NSDate date], BNDocs()];
+    NSString *mark = [NSString stringWithFormat:@"loaded(v7) %@\ndocs=%@\n", [NSDate date], BNDocs()];
     [mark writeToFile:BNPath(@"bnt_loaded.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *f in @[@"bnt_hooks.txt", @"bnt_debug.txt", @"baidu_links.txt", @"baidu_dlinks.txt"]) {
