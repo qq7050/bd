@@ -93,12 +93,13 @@ static void BDHandleRequest(NSURLRequest *req) {
 - (void)setSplashWindow:(id)arg1 { %orig(nil); }
 %end
 
+// 角标方法参数类型未知, 原样透传避免类型错配崩溃; 优先保证直链抓取主功能稳定
 %hook BDPanPersonHeaderView
-- (void)setTabBadgeNumber:(id)arg1 maxNumber:(id)arg2 atIndex:(id)arg3 { %orig(nil, nil, arg3); }
+- (void)setTabBadgeNumber:(id)arg1 maxNumber:(id)arg2 atIndex:(NSInteger)arg3 { %orig; }
 %end
 
 %hook BDPanPersonalWalletSection
-- (void)setTabBadgeNumber:(id)arg1 maxNumber:(id)arg2 atIndex:(id)arg3 { %orig(nil, nil, arg3); }
+- (void)setTabBadgeNumber:(id)arg1 maxNumber:(id)arg2 atIndex:(NSInteger)arg3 { %orig; }
 %end
 
 #pragma mark - 2. 网络层抓真实下载直链
