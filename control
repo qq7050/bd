@@ -1,8 +1,8 @@
-Package: com.hass.baiduspeedboost
-Name: BaiduSpeedBoost
-Version: 1.0
+Package: com.hass.baidunetdisktools
+Name: BaiduNetdiskTools
+Version: 2.0
 Architecture: iphoneos-arm
-Description: Local download speed-limit floor hook for Baidu Netdisk iOS 13.35.5. Keeps server-provided high values, raises only sub-floor limits. Does not touch SVIP flag (handled by existing baidudisk.dylib) or server-side speedUpToken/anti-cheat.
+Description: All-in-one Baidu Netdisk iOS 13.35.5 enhancement. Keeps SVIP flag + ad removal, and captures server-signed dlink URLs to /var/mobile/Documents for use with multi-threaded downloaders. Local speed-number hooks were removed because download bandwidth is enforced server-side.
 Maintainer: HASS
 Author: HASS
 Section: Tweaks
