@@ -1,14 +1,11 @@
 //
-//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v6)
+//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v8)
 //
-//  v5 结论: hook 机制完全成功(11个HOOK全OK, isSVIP/start/startDownloadTask命中),
-//           但下载走 P2P 路径, downWithServerFullPath/setDlink 都没触发。
-//  v6 方案:
-//   1) 在 start/startDownloadTask 命中时, 直接 dump DownOperation 实例的 dlink 相关 ivar
-//      (_dlink/_dlinkUrl/_serverFullPath/_downloadCDNHost/_downloadCDNPath/...),
-//      不管它走哪条下载路径都能拿到直链。
-//   2) 补 hook P2P 下载路径: startP2PUniversalDownload / startP2PNormalDownload
-//   3) 修广告 hook: 用真实存在的 BDNCAdvertiseDataManage.setAdModel: 等
+//  路线修正:
+//   - v6/v7 追 dlink dump 走偏了(DownOperation 实例里根本没有 dlink ivar, KVC/ivar 全取不到)。
+//   - 回到旧 BaiduSpeedBoost.dylib 验证过的限速方法族, 并补齐它 hook 的全部 9 个方法。
+//   - 去广告改用真正的总开关(BDPanPrologueAdManager.shouldSplashShow 等),
+//     之前 hook 的 isVipCanShowAdvertise 不是主开关, 所以一直有广告。
 //
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -30,175 +27,98 @@ static void BNAppend(NSString *file, NSString *line) {
 }
 static void BNDebug(NSString *s) { BNAppend(@"bnt_debug.txt", s); }
 static void BNHit(NSString *tag) { BNAppend(@"bnt_hooks.txt", [NSString stringWithFormat:@"HIT %@", tag]); }
-static void BNUrl(id obj, NSString *tag) {
-    NSString *s = nil;
-    if ([obj isKindOfClass:[NSString class]]) s = (NSString *)obj;
-    else if ([obj isKindOfClass:[NSURL class]]) s = [(NSURL *)obj absoluteString];
-    else if (obj) s = [obj description];
-    if (!s.length) return;
-    BNAppend(@"baidu_links.txt", s);
-    BNAppend(@"baidu_dlinks.txt", [NSString stringWithFormat:@"%@\t[%@]", s, tag]);
-}
 
-/* ---------- 核心: dump 对象 ivar 里的直链 ---------- */
-static BOOL BNInterestingIvar(NSString *name) {
-    NSString *s = [name lowercaseString];
-    NSArray *kw = @[@"dlink", @"dlinkurl", @"serverfullpath", @"downloadcdn",
-                    @"downloadurl", @"downloadlink", @"downpath", @"url", @"link", @"source"];
-    for (NSString *k in kw) if ([s rangeOfString:k].location != NSNotFound) return YES;
-    return NO;
+/* ---------- JSON 响应抓 dlink (最可靠的直链来源) ---------- */
+// dlink 是服务器 JSON 响应里的字段, 不在下载对象的 ivar 里。
+// hook NSJSONSerialization 的解析结果, 递归扫描所有 "dlink"/"downloadlink" 等 key。
+static BOOL BNIsLinkKey(NSString *k) {
+    NSString *s = [k lowercaseString];
+    return ([s isEqualToString:@"dlink"] || [s hasSuffix:@"dlink"] ||
+            [s rangeOfString:@"dlink"].location != NSNotFound ||
+            [s isEqualToString:@"downloadlink"] || [s isEqualToString:@"downloadurl"]);
 }
-// 把一个值转成安全字符串(NSString/NSURL/NSNumber), 其它对象一律不碰
-static NSString *BNSafeString(id val) {
-    if ([val isKindOfClass:[NSString class]]) return (NSString *)val;
-    if ([val isKindOfClass:[NSURL class]]) return [(NSURL *)val absoluteString];
-    if ([val isKindOfClass:[NSNumber class]]) return [(NSNumber *)val stringValue];
-    return nil;
-}
-static void BNRecordField(NSString *tag, NSString *name, NSString *s) {
-    if (!s.length) return;
-    BNAppend(@"bnt_debug.txt", [NSString stringWithFormat:@"  %@.%@ = %@", tag, name, s]);
-    if ([s hasPrefix:@"http"]) BNUrl(s, [NSString stringWithFormat:@"%@.%@", tag, name]);
-    if ([name rangeOfString:@"serverfullpath" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-        [name rangeOfString:@"cdnpath" options:NSCaseInsensitiveSearch].location != NSNotFound)
-        BNAppend(@"baidu_dlinks.txt", [NSString stringWithFormat:@"PATH(%@.%@): %@", tag, name, s]);
-}
-static void BNDumpIvars(id obj, NSString *tag) {
-    if (!obj) return;
-    BNAppend(@"bnt_debug.txt", [NSString stringWithFormat:@"DUMP BEGIN [%@] class=%@", tag, object_getClass(obj)]);
-
-    // 方法1: KVC 取值(最安全, 自动搜索父类, 基本类型返回NSNumber包装不崩)
-    // 直接按已知 key 取, 覆盖 dlink / serverFullPath / CDN 路径等全部关键字段
-    NSArray *keys = @[@"dlink", @"dlinkUrl", @"dLink", @"dlinkURL",
-                      @"serverFullPath", @"fileServerFullPath", @"associatedServerFullPath",
-                      @"downloadCDNHost", @"downloadCDNPath", @"downloadCDNServerList", @"downloadCDNClientIp",
-                      @"downloadUrl", @"downloadURL", @"downloadLink", @"downLoadLink",
-                      @"dlinkVideoExt", @"dlinkVideoFileId", @"dlinkVideoStoryId",
-                      @"encrypt_dlink", @"taskDownloadUrl", @"currentDownUrlArray"];
-    for (NSString *k in keys) {
-        id val = nil;
-        @try { val = [obj valueForKey:k]; }
-        @catch (NSException *e) { continue; }
-        NSString *s = BNSafeString(val);
-        BNRecordField(tag, k, s);
-    }
-
-    // 方法2: 逐层遍历继承链的 ivar, 只取对象类型(@)且非block, 避免野指针崩溃
-    Class cls = object_getClass(obj);
-    int depth = 0;
-    while (cls && depth < 8) {
-        unsigned int n = 0;
-        Ivar *ivars = class_copyIvarList(cls, &n);
-        for (unsigned int i = 0; i < n; i++) {
-            const char *cn = ivar_getName(ivars[i]);
-            if (!cn) continue;
-            NSString *name = [NSString stringWithUTF8String:cn];
-            if (!BNInterestingIvar(name)) continue;
-            const char *type = ivar_getTypeEncoding(ivars[i]);
-            if (!type || type[0] != '@' || type[1] == '?') continue;  // 跳过基本类型/block
-            id val = nil;
-            @try { val = object_getIvar(obj, ivars[i]); }
-            @catch (NSException *e) { continue; }
-            NSString *s = BNSafeString(val);
-            if (s.length) BNRecordField(tag, [NSString stringWithFormat:@"ivar:%@", name], s);
+static void BNScanJSON(id obj, int depth) {
+    if (!obj || depth > 8) return;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)obj;
+        for (id key in d) {
+            if (![key isKindOfClass:[NSString class]]) continue;
+            id v = [d objectForKey:key];
+            if (BNIsLinkKey(key) && [v isKindOfClass:[NSString class]]) {
+                NSString *link = (NSString *)v;
+                if ([link hasPrefix:@"http"]) BNAppend(@"baidu_links.txt", link);
+            }
+            BNScanJSON(v, depth + 1);
         }
-        free(ivars);
-        cls = class_getSuperclass(cls);
-        depth++;
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        for (id v in (NSArray *)obj) BNScanJSON(v, depth + 1);
     }
-    BNAppend(@"bnt_debug.txt", [NSString stringWithFormat:@"DUMP END [%@] depth=%d", tag, depth]);
+}
+
+/* ---------- 限速: 超大值 ---------- */
+// 旧 BaiduSpeedBoost.dylib 的核心: 把限速值换成极大 longLong。
+// 服务端限速改不了, 但本地这些策略方法返回超大值, 至少让 App 不再自己限速。
+static NSNumber *BNHuge(void) {
+    static NSNumber *v = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ v = [NSNumber numberWithLongLong:1024LL * 1024 * 1024 * 1024]; });
+    return v;
 }
 
 /* ---------- 原函数指针 ---------- */
-static void (*o_down)(id, SEL, id, id, long long) = NULL;
-static void (*o_start)(id, SEL) = NULL;
-static void (*o_startTask)(id, SEL) = NULL;
-static void (*o_dlPCS)(id, SEL) = NULL;
-static void (*o_startNormal)(id, SEL) = NULL;
-static void (*o_p2pUni)(id, SEL) = NULL;
-static void (*o_p2pNormal)(id, SEL) = NULL;
-static id  (*o_limit)(id, SEL) = NULL;
-static id  (*o_token)(id, SEL) = NULL;
-static void (*o_setDlink)(id, SEL, id) = NULL;
-static void (*o_setDlinkUrl)(id, SEL, id) = NULL;
+static id  (*o_calcLimit)(id, SEL) = NULL;
+static id  (*o_calcAllow)(id, SEL, BOOL) = NULL;
+static id  (*o_downLimit)(id, SEL) = NULL;
+static id  (*o_p2pLimit)(id, SEL) = NULL;
+static long long (*o_fileLimit)(id, SEL) = NULL;
+static BOOL (*o_shouldAccess)(id, SEL) = NULL;
+static BOOL (*o_canSpeed)(id, SEL) = NULL;
+static BOOL (*o_keepOrigP)(id, SEL) = NULL;
+static BOOL (*o_keepOrigS)(id, SEL) = NULL;
+static BOOL (*o_hotUser)(id, SEL) = NULL;
 static BOOL (*o_isSVIP)(id, SEL) = NULL;
-static void (*o_setAdModel)(id, SEL, id) = NULL;
-static void (*o_setupAlert)(id, SEL) = NULL;
-static void (*o_setupViews)(id, SEL) = NULL;
 static BOOL (*o_isVipAd)(id, SEL) = NULL;
+static BOOL (*o_shouldSplash)(id, SEL) = NULL;
+static BOOL (*o_hostSplash)(id, SEL) = NULL;
+static BOOL (*o_needFG)(id, SEL) = NULL;
+static BOOL (*o_fixNeedPlay)(id, SEL) = NULL;
+static void (*o_showAPISplash)(id, SEL, id) = NULL;
+static void (*o_showBrandSplash)(id, SEL, id) = NULL;
+static id (*o_JSONData)(id, SEL, id, unsigned long, id *) = NULL;
+static id (*o_JSONStream)(id, SEL, id, unsigned long, id *) = NULL;
 
-/* ---------- Hook 实现 ---------- */
-static void h_down(id self, SEL _cmd, id p, id l, long long sz) {
-    BNHit(@"DownOperation.downWithServerFullPath");
-    if (p) BNUrl(p, @"downWithServerFullPath");
-    if (o_down) o_down(self, _cmd, p, l, sz);
-}
-static void h_start(id self, SEL _cmd) {
-    BNHit(@"DownOperation.start");
-    BNDumpIvars(self, @"start");
-    if (o_start) o_start(self, _cmd);
-}
-static void h_startTask(id self, SEL _cmd) {
-    BNHit(@"DownOperation.startDownloadTask");
-    BNDumpIvars(self, @"startDownloadTask");
-    if (o_startTask) o_startTask(self, _cmd);
-}
-static void h_dlPCS(id self, SEL _cmd) {
-    BNHit(@"DownOperation.downloadFromPCS");
-    BNDumpIvars(self, @"downloadFromPCS");
-    if (o_dlPCS) o_dlPCS(self, _cmd);
-}
-static void h_startNormal(id self, SEL _cmd) {
-    BNHit(@"DownOperation.startNormalDownload");
-    BNDumpIvars(self, @"startNormalDownload");
-    if (o_startNormal) o_startNormal(self, _cmd);
-}
-static void h_p2pUni(id self, SEL _cmd) {
-    BNHit(@"DownOperation.startP2PUniversalDownload");
-    BNDumpIvars(self, @"startP2PUniversalDownload");
-    if (o_p2pUni) o_p2pUni(self, _cmd);
-}
-static void h_p2pNormal(id self, SEL _cmd) {
-    BNHit(@"DownOperation.startP2PNormalDownload");
-    BNDumpIvars(self, @"startP2PNormalDownload");
-    if (o_p2pNormal) o_p2pNormal(self, _cmd);
-}
-static id h_limit(id self, SEL _cmd) {
-    BNHit(@"DownOperation.calucateDownloadSpeedLimit");
-    id r = o_limit ? o_limit(self, _cmd) : nil;
-    BNDebug([NSString stringWithFormat:@"speedLimit=%@", r]);
-    return r;
-}
-static id h_token(id self, SEL _cmd) {
-    BNHit(@"DownOperation.speedUpToken");
-    id r = o_token ? o_token(self, _cmd) : nil;
-    BNDebug([NSString stringWithFormat:@"speedUpToken=%@", r]);
-    return r;
-}
-static void h_setDlink(id self, SEL _cmd, id u) {
-    BNHit(@"setDlink"); if (u) BNUrl(u, @"setDlink");
-    if (o_setDlink) o_setDlink(self, _cmd, u);
-}
-static void h_setDlinkUrl(id self, SEL _cmd, id u) {
-    BNHit(@"setDlinkUrl"); if (u) BNUrl(u, @"setDlinkUrl");
-    if (o_setDlinkUrl) o_setDlinkUrl(self, _cmd, u);
-}
-static BOOL h_isSVIP(id self, SEL _cmd) { BNHit(@"BDPanAccountInfo.isSVIP"); return YES; }
+/* ---------- Hook 实现: 限速 ---------- */
+static id h_calcLimit(id self, SEL _cmd) { BNHit(@"calcLimit"); return BNHuge(); }
+static id h_calcAllow(id self, SEL _cmd, BOOL a) { BNHit(@"calcAllow"); return BNHuge(); }
+static id h_downLimit(id self, SEL _cmd) { BNHit(@"downLoadSpeedLimit"); return BNHuge(); }
+static id h_p2pLimit(id self, SEL _cmd) { BNHit(@"p2pDownloadSpeedLimit"); return BNHuge(); }
+static long long h_fileLimit(id self, SEL _cmd) { BNHit(@"downloadFileSpeedLimit"); return 1024LL*1024*1024*1024; }
+static BOOL h_shouldAccess(id self, SEL _cmd) { BNHit(@"shouldAccessSpeedLimit"); return NO; }  // NO=不走限速
+static BOOL h_canSpeed(id self, SEL _cmd) { BNHit(@"canSpeedUp"); return YES; }
+static BOOL h_keepOrig(id self, SEL _cmd) { BNHit(@"isKeepOriginalDownloadSpeed"); return YES; }
+static BOOL h_hotUser(id self, SEL _cmd) { BNHit(@"isHotUserLimit"); return NO; }
+static BOOL h_isSVIP(id self, SEL _cmd) { BNHit(@"isSVIP"); return YES; }
+
+/* ---------- Hook 实现: 去广告 ---------- */
 static BOOL h_isVipAd(id self, SEL _cmd) { BNHit(@"isVipCanShowAdvertise"); return NO; }
-static void h_setAdModel(id self, SEL _cmd, id a) {
-    BNHit(@"BDNCAdvertiseDataManage.setAdModel");
-    // 传原值给 orig, 不置 nil(置 nil 可能让 orig 内部解引用崩溃)。去广告靠 isVipCanShowAdvertise=NO
-    if (o_setAdModel) o_setAdModel(self, _cmd, a);
+static BOOL h_shouldSplash(id self, SEL _cmd) { BNHit(@"shouldSplashShow"); return NO; }   // 开屏总开关
+static BOOL h_hostSplash(id self, SEL _cmd) { BNHit(@"shouldHostControlSplashShow"); return NO; }
+static BOOL h_needFG(id self, SEL _cmd) { BNHit(@"needToShowSplashInForeground"); return NO; }
+static BOOL h_fixNeedPlay(id self, SEL _cmd) { BNHit(@"fixSplashNeedPlay"); return NO; }
+static void h_showAPISplash(id self, SEL _cmd, id vc) { BNHit(@"BDNCAPISplashAd.show"); /* block: 不调 orig */ }
+static void h_showBrandSplash(id self, SEL _cmd, id vc) { BNHit(@"BDNCBrandSplashAd.show"); /* block */ }
+
+/* ---------- Hook 实现: JSON 抓直链 ---------- */
+static id h_JSONData(id self, SEL _cmd, id data, unsigned long opt, id *err) {
+    id r = o_JSONData ? o_JSONData(self, _cmd, data, opt, err) : nil;
+    if (r) { BNHit(@"JSONData"); BNScanJSON(r, 0); }
+    return r;
 }
-static void h_setupAlert(id self, SEL _cmd) {
-    BNHit(@"BDPanAdvertiseVideoAlertViewController.setupAlertView");
-    if (o_setupAlert) o_setupAlert(self, _cmd);
+static id h_JSONStream(id self, SEL _cmd, id stream, unsigned long opt, id *err) {
+    id r = o_JSONStream ? o_JSONStream(self, _cmd, stream, opt, err) : nil;
+    if (r) { BNHit(@"JSONStream"); BNScanJSON(r, 0); }
+    return r;
 }
-static void h_setupViews(id self, SEL _cmd) {
-    BNHit(@"BDPanFlowPlayerAdvertiseView.setupViews");
-    if (o_setupViews) o_setupViews(self, _cmd);
-}
-// (o_setupAlert / o_setupViews 已在上方原函数指针区声明)
 
 /* ---------- 动态 hook 安装器 ---------- */
 static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IMP *orig) {
@@ -215,34 +135,47 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
 }
 
 %ctor {
-    NSString *mark = [NSString stringWithFormat:@"loaded(v7) %@\ndocs=%@\n", [NSDate date], BNDocs()];
+    NSString *mark = [NSString stringWithFormat:@"loaded(v8) %@\ndocs=%@\n", [NSDate date], BNDocs()];
     [mark writeToFile:BNPath(@"bnt_loaded.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *f in @[@"bnt_hooks.txt", @"bnt_debug.txt", @"baidu_links.txt", @"baidu_dlinks.txt"]) {
+    for (NSString *f in @[@"bnt_hooks.txt", @"bnt_debug.txt"]) {
         if (![fm fileExistsAtPath:BNPath(f)])
             [@"" writeToFile:BNPath(f) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
-    BNDebug(@"=== v6 ctor start ===");
+    BNDebug(@"=== v8 ctor start ===");
 
-    // 下载主路径 + P2P
-    hookMethod(@"DownOperation", @"downWithServerFullPath:localFullPath:downsize:", (IMP)h_down,  (IMP*)&o_down);
-    hookMethod(@"DownOperation", @"start",                     (IMP)h_start,     (IMP*)&o_start);
-    hookMethod(@"DownOperation", @"startDownloadTask",         (IMP)h_startTask, (IMP*)&o_startTask);
-    hookMethod(@"DownOperation", @"downloadFromPCS",           (IMP)h_dlPCS,     (IMP*)&o_dlPCS);
-    hookMethod(@"DownOperation", @"startNormalDownload",       (IMP)h_startNormal,(IMP*)&o_startNormal);
-    hookMethod(@"DownOperation", @"startP2PUniversalDownload", (IMP)h_p2pUni,    (IMP*)&o_p2pUni);
-    hookMethod(@"DownOperation", @"startP2PNormalDownload",    (IMP)h_p2pNormal, (IMP*)&o_p2pNormal);
-    hookMethod(@"DownOperation", @"calucateDownloadSpeedLimit",(IMP)h_limit,     (IMP*)&o_limit);
-    hookMethod(@"DownOperation", @"speedUpToken",              (IMP)h_token,     (IMP*)&o_token);
-    hookMethod(@"BDPMDownloadOperation", @"setDlinkUrl:",       (IMP)h_setDlinkUrl,(IMP*)&o_setDlinkUrl);
-    hookMethod(@"BDPMFileDownloadModel", @"setDlink:",          (IMP)h_setDlink,  (IMP*)&o_setDlink);
-    hookMethod(@"BDPBridgeAlbumFileDlinkItem", @"setDlink:",    (IMP)h_setDlink,  (IMP*)&o_setDlink);
-    // SVIP + 去广告(用真实方法名)
-    hookMethod(@"BDPanAccountInfo", @"isSVIP",                  (IMP)h_isSVIP,    (IMP*)&o_isSVIP);
-    hookMethod(@"BDNCAdvertisesManage", @"isVipCanShowAdvertise",(IMP)h_isVipAd,  (IMP*)&o_isVipAd);
-    hookMethod(@"BDNCAdvertiseDataManage", @"setAdModel:",      (IMP)h_setAdModel,(IMP*)&o_setAdModel);
-    hookMethod(@"BDPanAdvertiseVideoAlertViewController", @"setupAlertView", (IMP)h_setupAlert, (IMP*)&o_setupAlert);
-    hookMethod(@"BDPanFlowPlayerAdvertiseView", @"setupViews",  (IMP)h_setupViews, (IMP*)&o_setupViews);
+    // === 限速方法族(旧 BaiduSpeedBoost.dylib 验证过的全部方法) ===
+    hookMethod(@"DownOperation", @"calucateDownloadSpeedLimit",       (IMP)h_calcLimit,   (IMP*)&o_calcLimit);
+    hookMethod(@"DownOperation", @"calucateDownloadSpeedLimitForAllow:",(IMP)h_calcAllow, (IMP*)&o_calcAllow);
+    hookMethod(@"DownOperation", @"downLoadSpeedLimit",               (IMP)h_downLimit,   (IMP*)&o_downLimit);
+    hookMethod(@"DownOperation", @"canSpeedUp",                       (IMP)h_canSpeed,    (IMP*)&o_canSpeed);
+    hookMethod(@"CloudP2PCommandModel", @"downloadSpeedLimit",        (IMP)h_p2pLimit,    (IMP*)&o_p2pLimit);
+    hookMethod(@"CDNRequestModel", @"shouldAccessSpeedLimit",         (IMP)h_shouldAccess,(IMP*)&o_shouldAccess);
+    hookMethod(@"SettingManage", @"downloadFileSpeedLimit",           (IMP)h_fileLimit,   (IMP*)&o_fileLimit);
+    hookMethod(@"SettingManage", @"isKeepOriginalDownloadSpeed",      (IMP)h_keepOrig,    (IMP*)&o_keepOrigS);
+    hookMethod(@"SettingManage", @"isHotUserLimit",                   (IMP)h_hotUser,     (IMP*)&o_hotUser);
+    hookMethod(@"PrivilegeModel", @"isKeepOriginalDownloadSpeed",     (IMP)h_keepOrig,    (IMP*)&o_keepOrigP);
 
-    BNDebug(@"=== v6 ctor end ===");
+    // === SVIP + 去广告总开关 ===
+    hookMethod(@"BDPanAccountInfo", @"isSVIP",                        (IMP)h_isSVIP,      (IMP*)&o_isSVIP);
+    hookMethod(@"BDNCAdvertisesManage", @"isVipCanShowAdvertise",     (IMP)h_isVipAd,     (IMP*)&o_isVipAd);
+    hookMethod(@"BDPanPrologueAdManager", @"shouldSplashShow",        (IMP)h_shouldSplash, (IMP*)&o_shouldSplash);
+    hookMethod(@"BDPanPrologueAdManager", @"shouldHostControlSplashShow",(IMP)h_hostSplash,(IMP*)&o_hostSplash);
+    hookMethod(@"BDPanGlobalSplashAdvertiseManager", @"needToShowSplashInForeground",(IMP)h_needFG,(IMP*)&o_needFG);
+    hookMethod(@"BDPanVideoFixSplashAdvertiseHandler", @"needPlay",   (IMP)h_fixNeedPlay, (IMP*)&o_fixNeedPlay);
+    hookMethod(@"BDNCAPISplashAd", @"showSplashViewInRootViewController:",(IMP)h_showAPISplash,(IMP*)&o_showAPISplash);
+    hookMethod(@"BDNCBrandSplashAd", @"showSplashViewInRootViewController:",(IMP)h_showBrandSplash,(IMP*)&o_showBrandSplash);
+
+    // === JSON 响应抓 dlink (类方法, 用元类 hook) ===
+    Class jsonMeta = objc_getMetaClass("NSJSONSerialization");
+    if (jsonMeta) {
+        SEL s1 = NSSelectorFromString(@"JSONObjectWithData:options:error:");
+        Method m1 = class_getClassMethod([NSJSONSerialization class], s1);
+        if (m1) { MSHookMessageEx(jsonMeta, s1, (IMP)h_JSONData, (IMP*)&o_JSONData); BNDebug(@"HOOK NSJSONSerialization.data OK"); }
+        SEL s2 = NSSelectorFromString(@"JSONObjectWithStream:options:error:");
+        Method m2 = class_getClassMethod([NSJSONSerialization class], s2);
+        if (m2) { MSHookMessageEx(jsonMeta, s2, (IMP)h_JSONStream, (IMP*)&o_JSONStream); BNDebug(@"HOOK NSJSONSerialization.stream OK"); }
+    }
+
+    BNDebug(@"=== v8 ctor end ===");
 }
