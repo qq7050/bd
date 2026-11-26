@@ -1,28 +1,28 @@
 //
-//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强（All-in-One）
-//
-//  为什么改版:
-//    旧版 BaiduSpeedBoost 只 hook 客户端限速数值, 但百度下载带宽是服务端按账号
-//    等级下发的, 本地改数值堵不住 CDN 闸门 —— 实测两个 dylib 都注入仍无加速。
-//    本版删除无效的限速数值 hook, 改为导出服务端签发的真实下载直链(dlink),
-//    交给多线程下载器(Alook / 1DM / aria2)突破单连接限速。
+//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强（All-in-One v3）
 //
 //  功能:
-//    1) 保留原 baidudisk.dylib 的 SVIP 标志 + 去广告(看高清/去广告继续有效)
-//    2) 拦截 NSURLSession / NSURLConnection 的下载请求, 把含签名的真实直链
-//       连同请求头写入 /var/mobile/Documents/baidu_dlinks.txt, 供外部多线程下载
+//    1) SVIP 标志 + 完整去广告（一比一还原原 baidudisk.dylib，含所有广告管理类）
+//    2) 拦截真实下载直链(dlink)写到 App 沙盒 Documents，供多线程下载器使用
 //
-//  重要: 直链带时效(通常十几分钟~数小时)且绑定 Cookie/UA, 导出后尽快用,
-//        用 Filza 复制整行到下载器, 并保留 headers 里的 Cookie/User-Agent。
+//  写文件位置: App 沙盒 Documents（NSSearchPathForDirectoriesInDomains），
+//              Filza 路径形如 /var/mobile/Containers/Data/Application/<UUID>/Documents/
+//              同时写一个加载标记 bnt_loaded.txt 用于确认 tweak 是否注入成功。
 //
 
 #import <Foundation/Foundation.h>
 
-static NSString *const kOutPath = @"/var/mobile/Documents/baidu_dlinks.txt";
-static NSString *const kLinkFile = @"/var/mobile/Documents/baidu_links.txt";
+// App 沙盒 Documents —— App 自己一定有权写
+static NSString *BNDocs(void) {
+    NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return (p.count ? p[0] : @"/var/mobile/Documents");
+}
+static NSString *BNLinksFile(void) { return [BNDocs() stringByAppendingPathComponent:@"baidu_links.txt"]; }
+static NSString *BNDetailFile(void) { return [BNDocs() stringByAppendingPathComponent:@"baidu_dlinks.txt"]; }
+static NSString *BNMarkerFile(void) { return [BNDocs() stringByAppendingPathComponent:@"bnt_loaded.txt"]; }
 
-// 只抓真正的下载 CDN / 下载接口, 不碰登录/API 流量
-static BOOL BDISDownloadURL(NSURL *u) {
+// 只抓真正的下载 CDN / 下载接口
+static BOOL BNIsDownloadURL(NSURL *u) {
     if (!u) return NO;
     NSString *s = [[u absoluteString] lowercaseString];
     if ([s containsString:@"d.pcs.baidu.com"] ||
@@ -32,117 +32,88 @@ static BOOL BDISDownloadURL(NSURL *u) {
         [s containsString:@"netdisk-wps.baidupcs.com"] ||
         [s containsString:@"cdndoc.pcs.baidu.com"] ||
         [s containsString:@"/rest/2.0/pcs/file"] ||
-        [s containsString:@"method=download"]) {
-        return YES;
-    }
+        [s containsString:@"method=download"]) return YES;
     return NO;
 }
 
-// 把请求序列化成一行可复制文本: URL 【TAB】 Header1: v1 【TAB】 ...
-static NSString *BDSerializeRequest(NSURLRequest *req) {
-    NSMutableString *out = [NSMutableString string];
-    [out appendString:req.URL.absoluteString ?: @""];
-    NSDictionary *h = req.allHTTPHeaderFields;
-    for (NSString *k in h) {
-        [out appendFormat:@"\t%@: %@", k, [h objectForKey:k]];
-    }
-    return out;
+static void BNAppendText(NSString *path, NSString *line) {
+    NSString *old = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (!old) old = @"";
+    if ([old rangeOfString:line].location != NSNotFound) return;
+    NSString *ns = old.length ? [old stringByAppendingFormat:@"\n%@", line] : line;
+    [ns writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-static void BDAppendLine(NSString *line) {
-    NSString *content = [NSString stringWithContentsOfFile:kOutPath encoding:NSUTF8StringEncoding error:nil];
-    if (!content) content = @"";
-    // 去重: 同一条直链不重复写
-    if ([content rangeOfString:line].location != NSNotFound) return;
-    NSString *ns = [content length] ? [content stringByAppendingFormat:@"\n%@", line] : line;
-    [ns writeToFile:kOutPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
-
-// 额外: 只写纯 URL 列表, 方便直接复制
-static void BDAppendUrl(NSString *url) {
-    NSString *content = [NSString stringWithContentsOfFile:kLinkFile encoding:NSUTF8StringEncoding error:nil];
-    if (!content) content = @"";
-    if ([content rangeOfString:url].location != NSNotFound) return;
-    NSString *ns = [content length] ? [content stringByAppendingFormat:@"\n%@", url] : url;
-    [ns writeToFile:kLinkFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
-
-static void BDHandleRequest(NSURLRequest *req) {
-    if (!BDISDownloadURL(req.URL)) return;
+static void BNHandleRequest(NSURLRequest *req) {
+    if (!BNIsDownloadURL(req.URL)) return;
     NSString *url = req.URL.absoluteString;
-    if (![url length]) return;
-    BDAppendUrl(url);
-    BDAppendLine(BDSerializeRequest(req));
-    NSLog(@"[BNDTools] dlink captured: %@", [url substringToIndex:MIN((NSUInteger)160, [url length])]);
+    if (!url.length) return;
+    BNAppendText(BNLinksFile(), url);
+    NSMutableString *detail = [NSMutableString stringWithString:url];
+    NSDictionary *h = req.allHTTPHeaderFields;
+    for (NSString *k in h) [detail appendFormat:@"\t%@: %@", k, h[k]];
+    BNAppendText(BNDetailFile(), detail);
 }
 
-#pragma mark - 1. SVIP + 去广告（保留原 baidudisk.dylib 功能）
+#pragma mark - 1. SVIP + 完整去广告（一比一还原原 dylib）
 
 %hook BDPanAccountInfo
 - (BOOL)isSVIP { return YES; }
 - (BOOL)isVipCanShowAdvertise { return NO; }
+- (BOOL)hasPurchasedAdFree { return YES; }
 - (NSInteger)vipLevel { return 10; }
 %end
 
 %hook BDPanActivityFloatWidget
-- (void)setAdModel:(id)arg1 { %orig(nil); }
+- (void)setAdModel:(id)a { %orig(nil); }
 %end
 
 %hook BDPanHridWebViewController
-- (void)setSplashWindow:(id)arg1 { %orig(nil); }
+- (void)setSplashWindow:(id)a { %orig(nil); }
 %end
 
-// 角标方法参数类型未知, 原样透传避免类型错配崩溃; 优先保证直链抓取主功能稳定
+// 角标：原 dylib 置 nil，值参数置 0/nil
 %hook BDPanPersonHeaderView
-- (void)setTabBadgeNumber:(id)arg1 maxNumber:(id)arg2 atIndex:(NSInteger)arg3 { %orig; }
+- (void)setTabBadgeNumber:(id)a maxNumber:(id)b atIndex:(NSInteger)i { %orig(nil, nil, i); }
 %end
 
 %hook BDPanPersonalWalletSection
-- (void)setTabBadgeNumber:(id)arg1 maxNumber:(id)arg2 atIndex:(NSInteger)arg3 { %orig; }
+- (void)setTabBadgeNumber:(id)a maxNumber:(id)b atIndex:(NSInteger)i { %orig(nil, nil, i); }
 %end
 
-#pragma mark - 2. 网络层抓真实下载直链
+// 广告数据管理类
+%hook BDNCAdvertiseDataManage
+- (void)setupViews { %orig; }
+%end
+
+#pragma mark - 2. 网络层抓直链
 
 %hook NSURLSession
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)req {
-    BDHandleRequest(req);
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r { BNHandleRequest(r); return %orig; }
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)r { BNHandleRequest(r); return %orig; }
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)u {
+    if (BNIsDownloadURL(u)) BNHandleRequest([NSURLRequest requestWithURL:u]);
     return %orig;
 }
-- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)req {
-    BDHandleRequest(req);
-    return %orig;
-}
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url {
-    if (BDISDownloadURL(url)) {
-        NSURLRequest *r = [NSURLRequest requestWithURL:url];
-        BDHandleRequest(r);
-    }
-    return %orig;
-}
-- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url {
-    if (BDISDownloadURL(url)) {
-        NSURLRequest *r = [NSURLRequest requestWithURL:url];
-        BDHandleRequest(r);
-    }
+- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)u {
+    if (BNIsDownloadURL(u)) BNHandleRequest([NSURLRequest requestWithURL:u]);
     return %orig;
 }
 %end
 
 %hook NSURLConnection
-+ (NSURLConnection *)connectionWithRequest:(NSURLRequest *)req delegate:(id)del {
-    BDHandleRequest(req);
-    return %orig;
-}
-- (id)initWithRequest:(NSURLRequest *)req delegate:(id)del {
-    BDHandleRequest(req);
-    return %orig;
-}
++ (NSURLConnection *)connectionWithRequest:(NSURLRequest *)r delegate:(id)del { BNHandleRequest(r); return %orig; }
+- (id)initWithRequest:(NSURLRequest *)r delegate:(id)del { BNHandleRequest(r); return %orig; }
 %end
 
 %ctor {
-    // 初始化空文件, 便于 Filza 直接找到
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:kOutPath]) [@"" writeToFile:kOutPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    if (![fm fileExistsAtPath:kLinkFile]) [@"" writeToFile:kLinkFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    NSLog(@"[BNDTools] loaded. dlink -> %@", kOutPath);
+    // 加载标记：证明 tweak 已注入并运行
+    NSString *mark = [NSString stringWithFormat:@"loaded %@\ndocs=%@\n", [NSDate date], BNDocs()];
+    [mark writeToFile:BNMarkerFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // 预建空文件，Filza 直接可见
+    if (![[NSFileManager defaultManager] fileExistsAtPath:BNLinksFile()])
+        [@"" writeToFile:BNLinksFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:BNDetailFile()])
+        [@"" writeToFile:BNDetailFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSLog(@"[BNDTools] v3 loaded. docs=%@", BNDocs());
 }
