@@ -1,5 +1,5 @@
 //
-//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v10)
+//  BaiduNetdiskTools — 百度网盘 iOS 13.35.5 巨魔增强 (v11)
 //
 //  v8 诊断: shouldSplashShow/isVipCanShowAdvertise 都 HIT 返回 NO 但广告还在
 //           -> 说明广告走的是"贴片/激励视频"路径, 不是开屏开关。
@@ -84,8 +84,9 @@ static NSNumber *BNHuge(void) {
     dispatch_once(&once, ^{ v = [NSNumber numberWithLongLong:1024LL * 1024 * 1024 * 1024]; });
     return v;
 }
-// 会员有效期: 2099-01-01 (double 时间戳)
-static double BNFutureTime(void) { return 4070908800.0; }
+// 会员有效期: 2099-01-01 (13 位毫秒时间戳)
+// 修 bug: 之前用 10 位秒级 4070908800, 百度按毫秒解读当成 1970 年 -> 界面显示"已过期 N 天"
+static double BNFutureTime(void) { return 4070908800000.0; }
 
 /* ---------- 原函数指针 ---------- */
 static id  (*o_calcLimit)(id, SEL) = NULL;
@@ -116,6 +117,10 @@ static BOOL h_hotUser(id self, SEL _cmd) { BNHit(@"isHotUserLimit"); return NO; 
 static BOOL h_yes(id self, SEL _cmd) { BNHit(NSStringFromSelector(_cmd)); return YES; }
 static long long h_vipLevel(id self, SEL _cmd) { BNHit(@"vipLevel"); return 10; }
 static double h_expire(id self, SEL _cmd) { BNHit(NSStringFromSelector(_cmd)); return BNFutureTime(); }
+// 抑制 SVIP 专属图标引导弹窗: 让 App 认为已经弹过很多次/最近刚弹过
+static long long h_guideTimes(id self, SEL _cmd) { BNHit(@"iconGuideTimes"); return 9999; }
+static id h_guideDate(id self, SEL _cmd) { BNHit(@"iconGuideDate"); return [NSDate date]; }
+static void h_iconNotify(id self, SEL _cmd, id n) { BNHit(@"iconNotifyBlocked"); /* 不调 orig, 拦掉弹窗触发 */ }
 
 /* ---------- Hook: 广告展示入口 (真正掐断) ---------- */
 // showAdvertise 系列: v16@0:8, 不调 orig 直接阻断广告展示
@@ -154,14 +159,14 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
 }
 
 %ctor {
-    NSString *mark = [NSString stringWithFormat:@"loaded(v10) %@\ndocs=%@\n", [NSDate date], BNDocs()];
+    NSString *mark = [NSString stringWithFormat:@"loaded(v11) %@\ndocs=%@\n", [NSDate date], BNDocs()];
     [mark writeToFile:BNPath(@"bnt_loaded.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *f in @[@"bnt_hooks.txt", @"bnt_debug.txt", @"baidu_real_dlinks.txt", @"baidu_cookie.txt", @"baidu_ua.txt"]) {
         if (![fm fileExistsAtPath:BNPath(f)])
             [@"" writeToFile:BNPath(f) atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
-    BNDebug(@"=== v10 ctor start ===");
+    BNDebug(@"=== v11 ctor start ===");
 
     // === 限速方法族 ===
     hookMethod(@"DownOperation", @"calucateDownloadSpeedLimit",       (IMP)h_calcLimit,   (IMP*)&o_calcLimit);
@@ -187,6 +192,12 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
     hookMethod(@"BDPanAccountInfo", @"vipLevel",          (IMP)h_vipLevel, NULL);
     hookMethod(@"BDPanAccountInfo", @"vipExpireTime",     (IMP)h_expire,   NULL);
     hookMethod(@"BDPanAccountInfo", @"svipExpireTime",    (IMP)h_expire,   NULL);
+
+    // === 抑制 SVIP 专属图标引导弹窗 ===
+    hookMethod(@"BDPanChangeAppIconManage", @"guideShownTimes",      (IMP)h_guideTimes, NULL);
+    hookMethod(@"BDPanChangeAppIconManage", @"lastGuideShownDate",   (IMP)h_guideDate,  NULL);
+    hookMethod(@"BDPanChangeAppIconManage", @"usinfoFetchSuccessNotification:", (IMP)h_iconNotify, NULL);
+    hookMethod(@"BDPanChangeAppIconManage", @"svipExpirationNotification:",     (IMP)h_iconNotify, NULL);
 
     // === 广告展示入口: 真正掐断 ===
     // 贴片/播放广告启动
@@ -216,5 +227,5 @@ static void hookMethod(NSString *clsName, NSString *selName, IMP replacement, IM
         if (m2) { MSHookMessageEx(jsonMeta, s2, (IMP)h_JSONStream, (IMP*)&o_JSONStream); BNDebug(@"HOOK NSJSONSerialization.stream OK"); }
     }
 
-    BNDebug(@"=== v10 ctor end ===");
+    BNDebug(@"=== v11 ctor end ===");
 }
